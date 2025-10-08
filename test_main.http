@@ -1,11 +1,26 @@
-# Test your FastAPI endpoints
-
+# FastAPI 기본 상태 점검
 GET http://127.0.0.1:8000/
 Accept: application/json
 
 ###
-
-GET http://127.0.0.1:8000/hello/User
+# 헬스 체크
+GET http://127.0.0.1:8000/health
 Accept: application/json
 
 ###
+# 모델 상태
+GET http://127.0.0.1:8000/model/status
+Accept: application/json
+
+###
+# 설정 (목표 프레임, 라벨)
+GET http://127.0.0.1:8000/config
+Accept: application/json
+
+###
+# 더미 추론 시뮬레이션 (프레임 없이 즉시)
+POST http://127.0.0.1:8000/simulate/predict
+Accept: application/json
+
+###
+# WebSocket /ws 는 HTTP 파일에서 직접 테스트 불가 (IDE WebSocket 도구나 브라우저 사용)
