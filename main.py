@@ -15,13 +15,24 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+
+# --- Predictor 모듈 임포트 ---
+try:
+    from processing.predictor import Predictor, get_predictor, CNN_BiLSTM_Attention, PositionalEncoding
+except ImportError as e:
+    print(f"[WARN] Predictor import failed: {e}. Inference will not be available.")
+    Predictor = None
+    get_predictor = None
+    CNN_BiLSTM_Attention = None
+    PositionalEncoding = None
 
 # 선택적 landmark 추출 모듈 (학습 coordinate_extractor 재현)
 SIGN_EXTRACT_LANDMARKS = os.getenv("SIGN_EXTRACT_LANDMARKS", "0") == "1"
@@ -49,70 +60,59 @@ except Exception:  # noqa
     RTCSessionDescription = None  # type: ignore
     RTCIceCandidate = None  # type: ignore
 
+# --- 상수 정의 ---
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_DIR = BASE_DIR / "models"
-MODEL_PATH = MODEL_DIR / "cnn_bilstm_attention_model.pth"
-
-TARGET_FRAME_COUNT = int(os.getenv("SIGN_SEQUENCE_TARGET_FRAMES", "60"))  # 테스트용 (실서비스: 9~10초 구간 프레임 수)
-INFERENCE_LABELS = ["안녕하세요", "감사합니다", "학교", "사람", "테스트"]  # Dummy labels
+TARGET_FRAME_COUNT = int(os.getenv("SIGN_SEQUENCE_TARGET_FRAMES", "30"))  # predictor.py와 일치시킴
 
 app = FastAPI(title="SignSense Test Server", version="0.1.0")
 
 
-# ----------------------------- Model Loader (Stub) -----------------------------
+# ----------------------------- Model & Inference Logic -----------------------------
 
-def load_model() -> Any:
-    """실제 추론 모델 로드 (현재는 더미). 실패해도 서버는 기동.
-    Returns: 모델 객체 또는 더미 식별자
+def run_inference(predictor: Predictor, frames: List[bytes]) -> Dict[str, Any]:
     """
-    if MODEL_PATH.exists() and torch is not None:
-        try:
-            model = torch.load(MODEL_PATH, map_location="cpu")
-            if hasattr(model, "eval"):
-                model.eval()
-            print(f"[MODEL] Loaded torch model: {MODEL_PATH.name}")
-            return model
-        except Exception as e:  # noqa
-            print(f"[MODEL][WARN] Torch model load failed: {e}. Fallback to dummy model.")
-    else:
-        if not MODEL_PATH.exists():
-            print(f"[MODEL][WARN] Model file not found: {MODEL_PATH}")
-        if torch is None:
-            print("[MODEL][WARN] torch not available in environment.")
-    return "DUMMY_MODEL"
-
-
-def dummy_infer(frames: List[bytes]) -> Dict[str, Any]:
-    """수신된 프레임 더미 추론 -> 랜덤 라벨 선택
-    실제 구현 시: MediaPipe -> Keypoint 추출 -> 시퀀스 전처리 -> 모델 추론 -> 후처리
+    수집된 프레임에 대해 랜드마크 추출 및 모델 추론을 수행합니다.
+    :param predictor: 초기화된 Predictor 객체
+    :param frames: WebRTC로 수신된 프레임 데이터 리스트
+    :return: 추론 결과 딕셔너리
     """
-    import random
-
     start = time.time()
 
     landmarks_info: Dict[str, Any] = {}
-    if SIGN_EXTRACT_LANDMARKS and extract_sequence_from_frames is not None:
+    predicted_label = "오류: 랜드마크 추출 실패"
+    score = 0.0
+
+    if not predictor:
+        predicted_label = "오류: Predictor가 로드되지 않았습니다."
+    elif SIGN_EXTRACT_LANDMARKS and extract_sequence_from_frames:
         try:
-            seq = extract_sequence_from_frames(frames, target_len=TARGET_FRAME_COUNT, skip_missing=False)  # type: ignore
-            if seq is not None:
+            # 1. 랜드마크 추출
+            landmark_sequence = extract_sequence_from_frames(frames, target_len=TARGET_FRAME_COUNT, skip_missing=False)
+
+            if landmark_sequence is not None and len(landmark_sequence) > 0:
                 landmarks_info = {
                     "enabled": True,
-                    "seq_shape": list(seq.shape),
+                    "seq_shape": list(np.array(landmark_sequence).shape),
                     "feature_dim": FRAME_FEATURE_DIM,
                 }
+                # 2. 모델 추론
+                predicted_label = predictor.predict(landmark_sequence)
+                # TODO: 실제 score 값도 predictor에서 반환하도록 수정 필요
+                score = 0.95  # 임시 score
             else:
-                landmarks_info = {"enabled": True, "error": "seq_none"}
-        except Exception as e:  # noqa
+                landmarks_info = {"enabled": True, "error": "landmark_sequence is None or empty"}
+                predicted_label = "오류: 랜드마크를 감지하지 못했습니다."
+
+        except Exception as e:
             landmarks_info = {"enabled": True, "error": str(e)}
+            predicted_label = f"오류: 추론 중 예외 발생 ({e})"
     else:
         landmarks_info = {"enabled": False}
+        predicted_label = "오류: 랜드마크 추출 기능이 비활성화되었습니다."
 
-    time.sleep(0.05)  # 모의 지연
-    label = random.choice(INFERENCE_LABELS)
-    score = round(random.uniform(0.75, 0.99), 3)
     end = time.time()
     return {
-        "predicted": label,
+        "predicted": predicted_label,
         "score": score,
         "inference_start": start,
         "inference_end": end,
@@ -158,7 +158,7 @@ class SequenceCollector:
 
 class AppState:
     def __init__(self):
-        self.model = None
+        self.predictor: Optional[Predictor] = None
         self.active_peers: Dict[str, RTCPeerConnection] = {}
         self.collectors: Dict[str, SequenceCollector] = {}
         self.lock = asyncio.Lock()
@@ -176,9 +176,23 @@ app.state.ss = AppState()  # type: ignore[attr-defined]
 
 @app.on_event("startup")
 async def startup_event():
-    print("[STARTUP] Loading model...")
-    app.state.ss.model = load_model()
-    print("[STARTUP] Model ready.")
+    """서버 시작 시 실제 추론 모델(Predictor)을 로드합니다."""
+    if get_predictor and CNN_BiLSTM_Attention and PositionalEncoding:
+        print("[STARTUP] Loading predictor...")
+        try:
+            # --- 모델 로드 오류 해결 ---
+            # torch.load가 __main__에서 클래스를 찾으므로, 수동으로 매핑해줍니다.
+            sys.modules['__main__'].CNN_BiLSTM_Attention = CNN_BiLSTM_Attention
+            sys.modules['__main__'].PositionalEncoding = PositionalEncoding
+
+            # get_predictor 함수를 호출하여 predictor 인스턴스를 로드하고 상태에 저장
+            app.state.ss.predictor = get_predictor()
+            print("[STARTUP] Predictor ready.")
+        except Exception as e:
+            print(f"[STARTUP][ERROR] Failed to load predictor: {e}")
+            app.state.ss.predictor = None
+    else:
+        print("[STARTUP][WARN] Predictor module not available. Running without inference.")
 
 
 # ----------------------------- REST Endpoints -----------------------------
@@ -195,47 +209,47 @@ async def health():
 
 @app.get("/model/status")
 async def model_status():
-    model_obj = app.state.ss.model
-    return {"model": str(type(model_obj)), "is_dummy": model_obj == "DUMMY_MODEL"}
+    predictor = app.state.ss.predictor
+    return {
+        "predictor_loaded": predictor is not None,
+        "model_path": str(predictor.model_path) if predictor else None,
+        "device": str(predictor.device) if predictor else None,
+    }
+
+@app.get("/client", response_class=HTMLResponse)
+async def serve_client_test_page():
+    """테스트용 HTML 클라이언트 페이지를 서빙합니다."""
+    client_path = BASE_DIR / "client_test.html"
+    if not client_path.is_file():
+        return HTMLResponse(
+            status_code=404,
+            content=f"<h1>404 Not Found</h1><p>client_test.html not found at {client_path}</p>"
+        )
+
+    with open(client_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+    return HTMLResponse(content=html_content, status_code=200)
 
 
-@app.get("/config")
-async def config():
-    return {"target_frame_count": TARGET_FRAME_COUNT, "labels": INFERENCE_LABELS}
+# ----------------------------- WebSocket Signaling -----------------------------
 
-
-@app.get("/client")
-async def client_page():
-    """테스트용 WebRTC + DataChannel 클라이언트 HTML 제공."""
-    html_file = BASE_DIR / "client_test.html"
-    if not html_file.exists():
-        return HTMLResponse("<h1>client_test.html not found</h1>", status_code=500)
-    try:
-        content = html_file.read_text(encoding="utf-8")
-    except Exception as e:  # noqa
-        return HTMLResponse(f"<h1>Failed to read client_test.html: {e}</h1>", status_code=500)
-    return HTMLResponse(content)
-
-
-# ----------------------------- WebSocket (Signaling & Result) -----------------------------
-
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    peer_id = f"peer_{id(ws)}"
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    peer_id = f"peer_{id(websocket)}"
     print(f"[WS] Connected: {peer_id}")
     pc: Optional[RTCPeerConnection] = None
     collector: Optional[SequenceCollector] = None
 
     async def safe_send_json(payload: Dict[str, Any]):
         try:
-            await ws.send_text(json.dumps(payload))
+            await websocket.send_text(json.dumps(payload))
         except Exception as e:  # noqa
             print(f"[WS][SEND][ERR] {e}")
 
     try:
         while True:
-            raw = await ws.receive_text()
+            raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -262,43 +276,50 @@ async def websocket_endpoint(ws: WebSocket):
                 # (aiortc 기본 예제: trickle ICE 생략. icecandidate 이벤트 데코레이터는 존재하지 않으므로
                 #  ICE 후보 전송이 필요하면 iceGatheringState 변화를 감시하고 localDescription 재전송 방식 적용 예정)
 
+                # --- 데이터 채널 콜백 정의 ---
                 @pc.on("datachannel")
-                def on_datachannel(channel):  # noqa
-                    print(f"[RTC] DataChannel opened: {channel.label}")
+                def on_datachannel(channel):
+                    print(f"[{session_id}] DataChannel '{channel.label}' created")
+                    collector = app.state.ss.new_collector(session_id)
 
                     @channel.on("message")
-                    def on_message(data):  # noqa
-                        nonlocal collector
-                        if isinstance(data, (bytes, bytearray)):
-                            if collector is None:
-                                collector = app.state.ss.new_collector(peer_id)
-                            collector.add_frame(bytes(data))
-                            if collector.is_ready():
-                                asyncio.create_task(process_sequence_and_respond())
-                        else:
-                            # 텍스트 제어 메시지 (예: 시작/끝 플래그) 처리 가능
-                            if data == "flush" and collector and not collector.is_ready():
-                                # 강제 처리 (디버그용)
-                                asyncio.create_task(process_sequence_and_respond(force=True))
+                    async def on_message(message):
+                        # 프레임 데이터 수신 및 수집
+                        collector.add_frame(message)
 
-                async def process_sequence_and_respond(force: bool = False):
-                    nonlocal collector
-                    if collector is None:
-                        return
-                    if not collector.is_ready() and not force:
-                        return
-                    if collector.processed:
-                        return
-                    collector.processed = True
-                    timings = collector.build_timings()
-                    inference_result = dummy_infer(collector.frames)
-                    result_payload = {
-                        "type": "result",
-                        "peer_id": peer_id,
-                        "timings": timings,
-                        "inference": inference_result,
-                    }
-                    await safe_send_json(result_payload)
+                        # 목표 프레임 수에 도달하면 추론 실행
+                        if collector.is_ready():
+                            collector.processed = True
+                            print(f"[{session_id}] Sequence ready. Running inference...")
+
+                            # 실제 추론 함수 호출
+                            result = run_inference(app.state.ss.predictor, collector.frames)
+
+                            # 타이밍 정보 추가
+                            result["timings"] = collector.build_timings()
+
+                            # 추론 결과를 클라이언트에 전송
+                            await channel.send(json.dumps(result))
+                            print(f"[{session_id}] Inference result sent: {result['predicted']}")
+
+                            # 수집기 초기화 (새로운 시퀀스 수집 준비)
+                            app.state.ss.collectors[session_id] = SequenceCollector(target_count=TARGET_FRAME_COUNT)
+
+                # --- ICE, 연결 상태 콜백 ---
+                @pc.on("icecandidate")
+                async def on_icecandidate(candidate):
+                    if candidate and candidate["candidate"]:
+                        await pc.addIceCandidate(candidate)
+
+                @pc.on("connectionstatechange")
+                def on_connection_state_change():
+                    print(f"[{session_id}] Connection state: {pc.connectionState}")
+                    if pc.connectionState == "failed":
+                        print(f"[{session_id}] Connection failed. Closing...")
+                        asyncio.create_task(websocket.close())
+                    elif pc.connectionState == "disconnected":
+                        print(f"[{session_id}] Disconnected.")
+                        asyncio.create_task(websocket.close())
 
                 # SDP 처리
                 await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=offer_type))
