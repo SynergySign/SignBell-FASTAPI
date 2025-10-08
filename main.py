@@ -62,7 +62,7 @@ except Exception:  # noqa
 
 # --- 상수 정의 ---
 BASE_DIR = Path(__file__).resolve().parent
-TARGET_FRAME_COUNT = int(os.getenv("SIGN_SEQUENCE_TARGET_FRAMES", "30"))  # predictor.py와 일치시킴
+TARGET_FRAME_COUNT = int(os.getenv("SIGN_SEQUENCE_TARGET_FRAMES", "300"))  # predictor.py와 일치시킴
 
 app = FastAPI(title="SignSense Test Server", version="0.1.0")
 

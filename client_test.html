@@ -46,9 +46,9 @@
 
 <fieldset>
   <legend>파라미터</legend>
-  <div class="row"><label for="interval">Frame Interval(ms)</label><input id="interval" type="number" value="150" min="33" step="1" /></div>
+  <div class="row"><label for="interval">Frame Interval(ms)</label><input id="interval" type="number" value="33" min="33" step="1" /></div>
   <div class="row"><label for="quality">JPEG Quality (0~1)</label><input id="quality" type="number" value="0.7" min="0.05" max="1" step="0.05" /></div>
-  <div class="row"><label for="targetFrames">Target Frames</label><input id="targetFrames" type="number" value="60" min="1" step="1" /></div>
+  <div class="row"><label for="targetFrames">Target Frames</label><input id="targetFrames" type="number" value="300" min="1" step="1" /></div>
   <div class="row"><button id="btnLoadConfig">서버 /config 반영</button></div>
 </fieldset>
 
@@ -257,7 +257,7 @@
           totalBytes += arr.byteLength;
           lastBytesEl.textContent = arr.byteLength;
           updateStats();
-          const target = parseInt(targetFramesInput.value,10) || 60;
+          const target = parseInt(targetFramesInput.value,10) || 300;
           if(sentFrames >= target){
             log('목표 프레임 도달. 전송 중지 대기.');
             stopCapture(false); // keep connection for result

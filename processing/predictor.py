@@ -69,7 +69,7 @@ class CNN_BiLSTM_Attention(nn.Module):
 
 # --- Predictor 모듈 ---
 class Predictor:
-    def __init__(self, model_path, num_classes=10, sequence_length=30, input_size=147):
+    def __init__(self, model_path, num_classes=10, sequence_length=300, input_size=147):
         """
         모델을 로드하고 추론을 준비합니다.
         :param model_path: .pth 모델 파일의 경로
@@ -139,7 +139,7 @@ def get_predictor():
     predictor = Predictor(
         model_path=str(model_path),
         num_classes=10,      # 예시: 10개의 수어 단어
-        sequence_length=30,  # 예시: 30프레임
+        sequence_length=300,  # 예시: 30프레임
         input_size=147       # 랜드마크 추출기(147D)에 맞게 수정
     )
     return predictor
