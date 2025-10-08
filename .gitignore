@@ -4,3 +4,4 @@ ENV/
 .venv/
 .env
 .idea/
+certs/*
