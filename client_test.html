@@ -179,20 +179,21 @@
 
   async function connect(){
     setStatus('connecting');
-    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    const sessionId = 'client_' + Date.now();
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/' + sessionId);
     ws.onopen = () => { log('WebSocket 연결','ok'); };
-    ws.onerror = (e) => { log('WebSocket 에러:'+ e,'err'); };
-    ws.onclose = () => { log('WebSocket 종료','warn'); setStatus('ws_closed'); };
+    ws.onerror = (e) => { log('WebSocket 에러:[object Event]','err'); console.error(e); };
+    ws.onclose = (e) => { log(`WebSocket 종료. Code: ${e.code}, Reason: ${e.reason}`,'warn'); setStatus('ws_closed'); };
     ws.onmessage = async (ev) => {
       try {
         const msg = JSON.parse(ev.data);
-        if(msg.action === 'answer'){
+        if(msg.type === 'answer'){ // 'action' 대신 'type'을 사용하도록 수정
           log('Answer 수신');
           await pc.setRemoteDescription({ type: msg.type, sdp: msg.sdp });
           setStatus('connected');
           btnDisconnect.disabled = false;
-        } else if(msg.type === 'result'){
-          log('Inference 결과 수신: '+ JSON.stringify(msg.inference));
+        } else if(msg.type === 'inference_result'){ // 'result' 대신 'inference_result'를 사용하도록 수정
+          log('Inference 결과 수신: '+ JSON.stringify(msg.data));
         } else if(msg.type === 'error'){
           log('Server Error: '+ msg.error,'err');
         } else if(msg.action === 'pong'){
@@ -339,4 +340,3 @@
 </script>
 </body>
 </html>
-

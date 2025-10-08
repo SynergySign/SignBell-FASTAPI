@@ -216,6 +216,10 @@ async def model_status():
         "device": str(predictor.device) if predictor else None,
     }
 
+@app.get("/config")
+async def get_config():
+    return {"target_frame_count": TARGET_FRAME_COUNT}
+
 @app.get("/client", response_class=HTMLResponse)
 async def serve_client_test_page():
     """테스트용 HTML 클라이언트 페이지를 서빙합니다."""
@@ -299,90 +303,69 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                             result["timings"] = collector.build_timings()
 
                             # 추론 결과를 클라이언트에 전송
-                            await channel.send(json.dumps(result))
-                            print(f"[{session_id}] Inference result sent: {result['predicted']}")
+                            await safe_send_json({
+                                "type": "inference_result",
+                                "data": result
+                            })
 
-                            # 수집기 초기화 (새로운 시퀀스 수집 준비)
-                            app.state.ss.collectors[session_id] = SequenceCollector(target_count=TARGET_FRAME_COUNT)
-
-                # --- ICE, 연결 상태 콜백 ---
-                @pc.on("icecandidate")
-                async def on_icecandidate(candidate):
-                    if candidate and candidate["candidate"]:
-                        await pc.addIceCandidate(candidate)
-
-                @pc.on("connectionstatechange")
-                def on_connection_state_change():
-                    print(f"[{session_id}] Connection state: {pc.connectionState}")
-                    if pc.connectionState == "failed":
-                        print(f"[{session_id}] Connection failed. Closing...")
-                        asyncio.create_task(websocket.close())
-                    elif pc.connectionState == "disconnected":
-                        print(f"[{session_id}] Disconnected.")
-                        asyncio.create_task(websocket.close())
-
-                # SDP 처리
+                # Offer SDP 적용 및 Answer 생성
                 await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=offer_type))
                 answer = await pc.createAnswer()
                 await pc.setLocalDescription(answer)
+
+                # 생성된 Answer를 클라이언트에 전송
                 await safe_send_json({
-                    "action": "answer",
+                    "type": "answer",
                     "sdp": pc.localDescription.sdp,
-                    "type": pc.localDescription.type,
                 })
-                print(f"[RTC] Answer sent to {peer_id}")
 
-            # --- ICE Candidate (클라이언트 -> 서버) ---
-            elif action == "candidate":
-                if pc is None or RTCIceCandidate is None:
+            # --- ICE Candidate 처리 ---
+            elif action == "ice-candidate":
+                if pc is None:
+                    await safe_send_json({"type": "error", "error": "peer_not_initialized"})
                     continue
-                candidate = msg.get("candidate")
-                sdp_mid = msg.get("sdpMid")
-                sdp_index = msg.get("sdpMLineIndex")
-                if candidate:
-                    ice_obj = RTCIceCandidate(candidate=candidate, sdpMid=sdp_mid, sdpMLineIndex=sdp_index)
-                    await pc.addIceCandidate(ice_obj)
 
-            # --- Ping ---
-            elif action == "ping":
-                await safe_send_json({"action": "pong", "ts": time.time()})
-
-            else:
-                await safe_send_json({"type": "error", "error": f"unknown_action:{action}"})
+                candidate_info = msg.get("candidate")
+                if candidate_info:
+                    candidate = RTCIceCandidate(
+                        sdpMid=candidate_info.get("sdpMid"),
+                        sdpMLineIndex=candidate_info.get("sdpMLineIndex"),
+                        candidate=candidate_info.get("candidate"),
+                    )
+                    await pc.addIceCandidate(candidate)
 
     except WebSocketDisconnect:
         print(f"[WS] Disconnected: {peer_id}")
-    except Exception as e:  # noqa
-        print(f"[WS][ERR] {peer_id}: {e}")
+    except Exception as e:
+        print(f"[WS][FATAL] Error in WebSocket handler for {peer_id}: {e}")
     finally:
-        # 정리
-        if pc:
+        if pc and peer_id in app.state.ss.active_peers:
             await pc.close()
-        if peer_id in app.state.ss.active_peers:
             del app.state.ss.active_peers[peer_id]
         if peer_id in app.state.ss.collectors:
             del app.state.ss.collectors[peer_id]
+        print(f"[WS] Cleaned up resources for {peer_id}")
 
 
-# ----------------------------- Utility for tests -----------------------------
-
-@app.post("/simulate/predict")
-async def simulate_predict():
-    fake_frames = [b"frame"] * TARGET_FRAME_COUNT
-    result = dummy_infer(fake_frames)
-    return JSONResponse(result)
-
-
-# ----------------------------- Run Helper -----------------------------
 if __name__ == "__main__":
-    # 개발 편의를 위한 직접 실행
     import uvicorn
 
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        ssl_keyfile="./certs/key.pem",
-        ssl_certfile="./certs/cert.pem",
-    )
+    # SSL/TLS 설정
+    # certs/cert.pem 및 certs/key.pem 파일이 필요합니다.
+    ssl_cert_path = BASE_DIR / "certs" / "cert.pem"
+    ssl_key_path = BASE_DIR / "certs" / "key.pem"
+
+    if not ssl_cert_path.is_file() or not ssl_key_path.is_file():
+        print("[WARN] SSL certificates not found. Running without HTTPS.")
+        print(f"         - Searched for: {ssl_cert_path}")
+        print(f"         - Searched for: {ssl_key_path}")
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        print("[INFO] Starting server with HTTPS.")
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=8000,
+            ssl_keyfile=str(ssl_key_path),
+            ssl_certfile=str(ssl_cert_path),
+        )
