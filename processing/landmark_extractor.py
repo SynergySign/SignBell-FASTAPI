@@ -36,28 +36,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Any
 
-# -------- Optional Dependencies (Graceful Fallback) --------
-try:
-    import numpy as np  # type: ignore
-except Exception:  # noqa: E722
-    np = None  # type: ignore
-
-try:
-    import mediapipe as mp  # type: ignore
-except Exception:  # noqa: E722
-    mp = None  # type: ignore
-
-try:
-    import cv2  # type: ignore
-except Exception:  # noqa: E722
-    cv2 = None  # type: ignore
-
-try:
-    from PIL import Image  # type: ignore
-    import io
-except Exception:  # noqa: E722
-    Image = None  # type: ignore
-    io = None  # type: ignore
+# -------- Dependencies --------
+import numpy as np
+import mediapipe as mp
+import cv2
+from PIL import Image
+import io
 
 
 POSE_INDICES = [11, 12, 13, 14, 15, 16]
@@ -71,15 +55,12 @@ HAND_LANDMARK_COUNT = 21
 
 def _decode_frame(frame_bytes: bytes):
     """Decode JPEG/PNG bytes -> RGB ndarray (uint8). Returns None on failure."""
-    if np is None:
-        return None
     # 우선 OpenCV 사용 (속도 유리)
-    if cv2 is not None:
-        arr = np.frombuffer(frame_bytes, dtype=np.uint8)
-        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            return None
-        return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return None
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     # Pillow fallback
     if Image is not None and io is not None:
         try:
@@ -101,9 +82,6 @@ class RealtimeLandmarkExtractor:
     _ok: bool = field(init=False, default=False)
 
     def __post_init__(self):
-        if mp is None or np is None:
-            self._ok = False
-            return
         try:
             self._holistic = mp.solutions.holistic.Holistic(
                 static_image_mode=self.static_image_mode,
@@ -145,13 +123,13 @@ class RealtimeLandmarkExtractor:
             results = self._holistic.process(rgb)  # type: ignore[union-attr]
         except Exception:  # noqa: E722
             return None
-        if (not hasattr(results, "pose_landmarks") or results.pose_landmarks is None):
+        if (not hasattr(results, "pose_landmarks")
+                or results.pose_landmarks is None
+                or not results.pose_landmarks.landmark):
             if self.skip_missing:
                 return None
             # zero frame 채움
-            if np is not None:
-                return np.zeros((FRAME_FEATURE_DIM,), dtype=np.float32)
-            return None
+            return np.zeros((FRAME_FEATURE_DIM,), dtype=np.float32)
 
         pose_lm = results.pose_landmarks.landmark
         nose = pose_lm[0]
@@ -174,51 +152,64 @@ class RealtimeLandmarkExtractor:
             )
 
         # Pose 6 joints
-        for idx in POSE_INDICES:
-            v = pose_lm[idx]
-            rx, ry, rz = _rel(v, stable_center_x, stable_center_y, stable_center_z, NORMALIZATION_SCALE, POSE_Z_DAMPING)
-            feats.extend([rx, ry, rz])
+        try:
+            for idx in POSE_INDICES:
+                v = pose_lm[idx]
+                rx, ry, rz = _rel(v, stable_center_x, stable_center_y, stable_center_z, NORMALIZATION_SCALE, POSE_Z_DAMPING)
+                feats.extend([rx, ry, rz])
+        except Exception as e:
+            print(f"Error processing pose landmarks: {e}")
+            # Re-raise or handle as appropriate
+            raise
 
         # Left hand
         left_wrist_pos = None
-        if hasattr(results, "left_hand_landmarks") and results.left_hand_landmarks:
-            lms = results.left_hand_landmarks.landmark
-            wrist = lms[0]
-            wx, wy, wz = _rel(wrist, stable_center_x, stable_center_y, stable_center_z, NORMALIZATION_SCALE, WRIST_Z_DAMPING)
-            left_wrist_pos = (wx, wy, wz)
-            feats.extend([wx, wy, wz])  # wrist relative to stable center
-            for i in range(1, HAND_LANDMARK_COUNT):  # 1..20
-                f = lms[i]
-                fx = (f.x - wrist.x) / NORMALIZATION_SCALE
-                fy = (f.y - wrist.y) / NORMALIZATION_SCALE
-                fz = ((f.z - wrist.z) / NORMALIZATION_SCALE) * FINGER_Z_DAMPING
-                feats.extend([fx, fy, fz])
-            # 만약 landmark 개수가 부족하면 패딩
-            missing = HAND_LANDMARK_COUNT - len(lms)
-            if missing > 0:
-                feats.extend([0.0] * (missing * 3))
-        else:
-            feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3))
+        try:
+            if hasattr(results, "left_hand_landmarks") and results.left_hand_landmarks and results.left_hand_landmarks.landmark:
+                lms = results.left_hand_landmarks.landmark
+                wrist = lms[0]
+                wx, wy, wz = _rel(wrist, stable_center_x, stable_center_y, stable_center_z, NORMALIZATION_SCALE, WRIST_Z_DAMPING)
+                left_wrist_pos = (wx, wy, wz)
+                feats.extend([wx, wy, wz])  # wrist relative to stable center
+                for i in range(1, HAND_LANDMARK_COUNT):  # 1..20
+                    f = lms[i]
+                    fx = (f.x - wrist.x) / NORMALIZATION_SCALE
+                    fy = (f.y - wrist.y) / NORMALIZATION_SCALE
+                    fz = ((f.z - wrist.z) / NORMALIZATION_SCALE) * FINGER_Z_DAMPING
+                    feats.extend([fx, fy, fz])
+                # 만약 landmark 개수가 부족하면 패딩
+                missing = HAND_LANDMARK_COUNT - len(lms)
+                if missing > 0:
+                    feats.extend([0.0] * (missing * 3))
+            else:
+                feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3))
+        except Exception as e:
+            print(f"Error processing left hand landmarks: {e}")
+            raise
 
         # Right hand
         right_wrist_pos = None
-        if hasattr(results, "right_hand_landmarks") and results.right_hand_landmarks:
-            lms = results.right_hand_landmarks.landmark
-            wrist = lms[0]
-            wx, wy, wz = _rel(wrist, stable_center_x, stable_center_y, stable_center_z, NORMALIZATION_SCALE, WRIST_Z_DAMPING)
-            right_wrist_pos = (wx, wy, wz)
-            feats.extend([wx, wy, wz])
-            for i in range(1, HAND_LANDMARK_COUNT):
-                f = lms[i]
-                fx = (f.x - wrist.x) / NORMALIZATION_SCALE
-                fy = (f.y - wrist.y) / NORMALIZATION_SCALE
-                fz = ((f.z - wrist.z) / NORMALIZATION_SCALE) * FINGER_Z_DAMPING
-                feats.extend([fx, fy, fz])
-            missing = HAND_LANDMARK_COUNT - len(lms)
-            if missing > 0:
-                feats.extend([0.0] * (missing * 3))
-        else:
-            feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3))
+        try:
+            if hasattr(results, "right_hand_landmarks") and results.right_hand_landmarks and results.right_hand_landmarks.landmark:
+                lms = results.right_hand_landmarks.landmark
+                wrist = lms[0]
+                wx, wy, wz = _rel(wrist, stable_center_x, stable_center_y, stable_center_z, NORMALIZATION_SCALE, WRIST_Z_DAMPING)
+                right_wrist_pos = (wx, wy, wz)
+                feats.extend([wx, wy, wz])
+                for i in range(1, HAND_LANDMARK_COUNT):
+                    f = lms[i]
+                    fx = (f.x - wrist.x) / NORMALIZATION_SCALE
+                    fy = (f.y - wrist.y) / NORMALIZATION_SCALE
+                    fz = ((f.z - wrist.z) / NORMALIZATION_SCALE) * FINGER_Z_DAMPING
+                    feats.extend([fx, fy, fz])
+                missing = HAND_LANDMARK_COUNT - len(lms)
+                if missing > 0:
+                    feats.extend([0.0] * (missing * 3))
+            else:
+                feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3))
+        except Exception as e:
+            print(f"Error processing right hand landmarks: {e}")
+            raise
 
         # Hand distance vector
         if left_wrist_pos and right_wrist_pos:
@@ -229,8 +220,6 @@ class RealtimeLandmarkExtractor:
         else:
             feats.extend([0.0, 0.0, 0.0])
 
-        if np is None:
-            return None
         arr = np.asarray(feats, dtype=np.float32)
         if arr.shape[0] != FRAME_FEATURE_DIM:
             # 안전 실패: 차원 불일치 → 패딩/절단
@@ -270,8 +259,6 @@ def extract_sequence_from_frames(frames: List[bytes], target_len: Optional[int] 
     """프레임 바이트 리스트 -> (T|target_len, 147) numpy or None.
     mediapipe / numpy 없으면 None.
     """
-    if np is None or mp is None:
-        return None
     extractor = RealtimeLandmarkExtractor(skip_missing=skip_missing)
     if not extractor.available():
         return None
