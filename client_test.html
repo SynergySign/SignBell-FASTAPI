@@ -197,6 +197,10 @@
           btnDisconnect.disabled = false;
         } else if(msg.type === 'inference_result'){ // 'result' 대신 'inference_result'를 사용하도록 수정
           log('Inference 결과 수신: '+ JSON.stringify(msg.data));
+          // 추론 완료 후 리셋 준비
+          setStatus('inference_done');
+          log('추론 완료. 1초 후 다음 캡처를 위해 리셋합니다.');
+          setTimeout(resetForNextCapture, 1000);
         } else if(msg.type === 'error'){
           log('Server Error: '+ msg.error,'err');
         } else if(msg.action === 'pong'){
@@ -293,7 +297,7 @@
     const collectionTime = parseFloat(collectionTimeInput.value) || 5.0;
     log(`캡처 시작. ${collectionTime}초 후에 자동으로 중지됩니다.`);
     stopTimer = setTimeout(() => {
-        log('설정된 시간 도달. 전송 중지.');
+        log('설정된 시간 도달. 전송 중지 및 추론 요청.');
         stopCapture(false); // 수동 중지가 아님
     }, collectionTime * 1000);
 
@@ -302,22 +306,40 @@
   }
 
   function stopCapture(manual=true){
+    if (stopped) return; // 중복 호출 방지
     stopped = true;
     if(captureTimer){ clearTimeout(captureTimer); captureTimer=null; }
     if(stopTimer){ clearTimeout(stopTimer); stopTimer=null; } // 자동 중지 타이머도 클리어
     btnStop.disabled=true;
-    // DataChannel이 열려있으면 Start 버튼 활성화
-    if (dc && dc.readyState === 'open') {
+
+    // 수동으로 중지할 때만 Start 버튼을 즉시 활성화
+    if (manual && dc && dc.readyState === 'open') {
         btnStart.disabled = false;
     }
-    if(manual) log('캡처 수동 중지');
-    if(manual) setStatus('connected');
+
+    if(manual) {
+      log('캡처 수동 중지');
+      setStatus('connected');
+    } else {
+      // 자동 중지 시 flush 신호 전송
+      flush();
+    }
   }
 
   function flush(){
     if(dc && dc.readyState === 'open'){
       dc.send('flush');
       log('flush 전송');
+    }
+  }
+
+  function resetForNextCapture() {
+    if (dc && dc.readyState === 'open') {
+        dc.send('reset');
+        log('서버에 리셋 신호 전송');
+        btnStart.disabled = false;
+        setStatus('connected');
+        log('준비 완료. 다시 캡처를 시작할 수 있습니다.');
     }
   }
 

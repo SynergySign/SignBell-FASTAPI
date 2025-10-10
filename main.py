@@ -243,44 +243,44 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     @pc.on("datachannel")
     def on_datachannel(channel):
         print(f"[{session_id}] DataChannel '{channel.label}' created")
-        collector = app.state.ss.new_collector(session_id)
+        # collector를 직접 생성하지 않고, 래퍼 딕셔너리를 사용해 관리
+        collector_wrapper = {'collector': app.state.ss.new_collector(session_id)}
 
-        async def run_inference_after_delay():
-            """지정된 시간(5초) 후 추론을 실행하고 결과를 전송하는 비동기 작업"""
-            await asyncio.sleep(COLLECTION_DURATION_SECONDS)
-
+        async def run_inference_once():
+            """추론을 한 번만 실행하는 헬퍼 함수"""
+            collector = collector_wrapper['collector']
             if collector.processed:
-                return  # 이미 다른 작업에서 처리된 경우 중복 실행 방지
-
+                return
             collector.processed = True
-            print(f"[{session_id}] Collection time finished. Running inference...")
 
-            try:
-                result = run_inference(app.state.ss.predictor, collector.frames)
-                result["timings"] = collector.build_timings()
+            print(f"[{session_id}] Flush signal received. Running inference...")
 
-                await safe_send_json({
-                    "type": "inference_result",
-                    "data": result
-                })
-            except Exception as e:
-                print(f"[{session_id}][ERR] Inference task failed: {e}")
-                await safe_send_json({
-                    "type": "error",
-                    "message": f"Inference failed: {e}"
-                })
+            result = run_inference(app.state.ss.predictor, collector.frames)
+            result["timings"] = collector.build_timings()
+
+            await safe_send_json({
+                "type": "inference_result",
+                "data": result
+            })
 
         @channel.on("message")
         async def on_message(message):
-            # 첫 프레임 수신 시에만 5초 타이머를 시작합니다.
-            if collector.start_ts is None:
-                print(f"[{session_id}] First frame received. Starting {COLLECTION_DURATION_SECONDS}s timer for inference.")
-                collector.start_collection()
-                # 비동기 추론 작업을 예약합니다.
-                asyncio.create_task(run_inference_after_delay())
+            if isinstance(message, str):
+                if message == "flush":
+                    await run_inference_once()
+                elif message == "reset":
+                    print(f"[{session_id}] Resetting collector for new capture.")
+                    # 새 collector로 교체
+                    collector_wrapper['collector'] = app.state.ss.new_collector(session_id)
+                return
 
+            collector = collector_wrapper['collector']
             # 추론이 시작되기 전까지(processed=False) 프레임을 계속 수집합니다.
             if not collector.processed:
+                # 첫 프레임 수신 시 로그를 남깁니다.
+                if collector.start_ts is None:
+                    collector.start_collection()
+                    print(f"[{session_id}] First frame received. Collecting frames...")
                 collector.add_frame(message)
 
     try:
