@@ -4,4 +4,5 @@ ENV/
 .venv/
 .env
 .idea/
-certs/*
+certs/cert.pem
+certs/key.pem
