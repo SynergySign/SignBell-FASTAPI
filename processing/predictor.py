@@ -5,125 +5,210 @@ from pathlib import Path
 import math
 
 # --- 모델 클래스 정의 ---
+# 학습 스크립트(cnn_bilstm_attention_classifier.py)와 동일한 모델 구조로 교체합니다.
 
 class PositionalEncoding(nn.Module):
-    """
-    Transformer 모델에서 사용하는 Positional Encoding을 구현합니다.
-    모델이 저장될 때 이 클래스도 함께 저장되었을 가능성이 높습니다.
-    """
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
+    """Sinusoidal Positional Encoding (batch_first)"""
+    def __init__(self, d_model, max_len=500):
+        super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x: (batch_size, sequence_length, d_model)
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+        # x: (batch, seq_len, d_model)
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len]
 
-# 참고: 이 클래스는 'models/cnn_bilstm_attention_model.pth' 파일이 저장될 때 사용된
-# 모델의 아키텍처와 정확히 일치해야 합니다.
-# 만약 실제 모델과 구조가 다를 경우, 여기서 수정해야 합니다.
+
 class CNN_BiLSTM_Attention(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, sequence_length):
-        super(CNN_BiLSTM_Attention, self).__init__()
-        # 이 부분은 모델의 실제 구조에 따라 변경되어야 합니다.
-        # 아래는 파일명을 기반으로 한 기본적인 추정입니다.
-        self.feature_embedding = nn.Linear(input_size, hidden_size)
-        self.pos_encoder = PositionalEncoding(hidden_size)
-        self.cnn = nn.Conv1d(in_channels=hidden_size, out_channels=hidden_size, kernel_size=3, padding=1)
-        self.relu = nn.ReLU()
-        self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
-        self.attention = nn.Linear(hidden_size * 2, 1)
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
+    """학습 스크립트와 동일한 모델 아키텍처"""
+
+    def __init__(self, input_size=147, num_classes=7,
+                 cnn_channels=[64, 128, 256],
+                 lstm_hidden=128,
+                 dropout=0.5):
+        super().__init__()
+
+        # 1D-CNN Layers
+        self.conv_layers = nn.ModuleList()
+        in_channels = input_size
+
+        for out_channels in cnn_channels:
+            self.conv_layers.append(nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm1d(out_channels),
+                nn.ReLU(),
+                nn.Dropout(dropout * 0.5)
+            ))
+            in_channels = out_channels
+
+        # Bi-LSTM
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels[-1],
+            hidden_size=lstm_hidden,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout
+        )
+
+        # Multi-Head Attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=lstm_hidden * 2,
+            num_heads=8,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Classification Head
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_hidden * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
+        )
+
+        # Layer Normalization
+        self.layer_norm = nn.LayerNorm(lstm_hidden * 2)
+
+        # 동작 변화점 가중치 학습
+        self.temporal_weight = nn.Parameter(torch.tensor(0.1))
+        self.change_detector = nn.Sequential(
+            nn.Linear(lstm_hidden * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+        # Positional Encoding
+        self.pos_encoding = PositionalEncoding(d_model=lstm_hidden * 2, max_len=500)
 
     def forward(self, x):
-        # x: (batch_size, sequence_length, input_size)
+        batch_size, seq_len, features = x.size()
 
-        # 1. Feature Embedding & Positional Encoding
-        x = self.feature_embedding(x) # (batch_size, sequence_length, hidden_size)
-        x = self.pos_encoder(x)       # (batch_size, sequence_length, hidden_size)
+        x_cnn = x.transpose(1, 2)
 
-        # 2. CNN
-        x = x.permute(0, 2, 1) # (batch_size, hidden_size, sequence_length)
-        x = self.cnn(x)
-        x = self.relu(x)
-        x = x.permute(0, 2, 1) # (batch_size, sequence_length, hidden_size)
-        
-        # 3. BiLSTM
-        lstm_out, _ = self.lstm(x) # (batch_size, sequence_length, hidden_size * 2)
-        
-        # 4. Attention
-        attention_weights = torch.softmax(self.attention(lstm_out), dim=1)
-        context_vector = torch.sum(attention_weights * lstm_out, dim=1) # (batch_size, hidden_size * 2)
-        
-        out = self.fc(context_vector)
-        return out
+        for conv_layer in self.conv_layers:
+            x_cnn = conv_layer(x_cnn)
+
+        x_cnn = x_cnn.transpose(1, 2)
+
+        lstm_out, _ = self.lstm(x_cnn)
+        lstm_out = self.layer_norm(lstm_out)
+        lstm_out = self.pos_encoding(lstm_out)
+
+        change_scores = self.change_detector(lstm_out).squeeze(-1)
+        attn_out, attn_weights = self.attention(lstm_out, lstm_out, lstm_out)
+
+        change_weights = change_scores.unsqueeze(-1) * self.temporal_weight
+        weighted_attn = attn_out * (1 + change_weights)
+
+        context_vector = weighted_attn.mean(dim=1)
+        output = self.classifier(context_vector)
+
+        # 추론 시에는 output만 반환하도록 수정
+        return output
 
 # --- Predictor 모듈 ---
 class Predictor:
-    def __init__(self, model_path, num_classes=10, sequence_length=300, input_size=147):
+    def __init__(self, model_path, sequence_length=300, input_size=147):
         """
         모델을 로드하고 추론을 준비합니다.
-        :param model_path: .pth 모델 파일의 경로
-        :param num_classes: 모델의 출력 클래스 수
-        :param sequence_length: 모델이 기대하는 입력 시퀀스 길이
-        :param input_size: 각 프레임의 랜드마크 특성 수 (e.g., 49 * 3 = 147)
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"🤖 Predictor가 사용할 디바이스: {self.device}")
 
-        # 모델 구조 정의
-        # 참고: hidden_size, num_layers는 저장된 모델과 동일한 값이어야 합니다.
+        # 1. 체크포인트를 먼저 로드하여 모델의 설정을 확인합니다.
+        checkpoint = torch.load(model_path, map_location=self.device)
+
+        # 2. 체크포인트에서 클래스 개수와 레이블 정보를 가져옵니다.
+        if 'label_encoder' in checkpoint:
+            self.label_encoder = checkpoint['label_encoder']
+            num_classes = len(self.label_encoder.classes_)
+            self.class_labels = {i: label for i, label in enumerate(self.label_encoder.classes_)}
+            print(f"✅ 체크포인트에서 {num_classes}개의 클래스 정보를 로드했습니다.")
+        else:
+            # label_encoder가 없는 경우, state_dict에서 직접 추론합니다.
+            try:
+                num_classes = checkpoint['model_state_dict']['classifier.6.bias'].shape[0]
+                self.class_labels = {i: f'Sign_{i}' for i in range(num_classes)}
+                print(f"⚠️ 체크포인트에 레이블 정보가 없어, 모델 가중치에서 {num_classes}개 클래스를 추론했습니다.")
+            except KeyError:
+                raise ValueError("모델 체크포인트에서 클래스 개수를 확인할 수 없습니다.")
+
+        # 3. 확인된 클래스 개수로 모델 구조를 정의합니다.
         self.model = CNN_BiLSTM_Attention(
             input_size=input_size,
-            hidden_size=256,
-            num_layers=2,
-            num_classes=num_classes,
-            sequence_length=sequence_length
+            num_classes=num_classes, # 동적으로 설정된 클래스 개수 사용
+            cnn_channels=[64, 128, 256],
+            lstm_hidden=128,
+            dropout=0.5
         ).to(self.device)
 
-        # 모델 가중치 로드
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        # 4. 모델 가중치를 로드합니다.
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'model' in checkpoint and isinstance(checkpoint['model'], nn.Module):
+            state_dict = checkpoint['model'].state_dict()
+        else:
+            state_dict = checkpoint
+
+        self.model.load_state_dict(state_dict)
         self.model.eval()  # 추론 모드로 설정
-        
-        # TODO: 클래스 레이블 맵을 실제 학습 데이터에 맞게 수정해야 합니다.
-        self.class_labels = {i: f'Sign_{i}' for i in range(num_classes)}
+
         print(f"✅ Predictor 초기화 완료. 모델: {model_path}")
 
-    def predict(self, landmark_sequence: list) -> str:
+    def predict(self, landmark_sequence: np.ndarray) -> tuple[str, float]:
         """
-        랜드마크 시퀀스를 받아 예측을 수행합니다.
-        :param landmark_sequence: 랜드마크 데이터의 리스트 (길이는 sequence_length와 유사해야 함)
-        :return: 예측된 클래스 레이블 (문자열)
+        랜드마크 시퀀스를 받아 예측을 수행하고, 레이블과 신뢰도 점수를 반환합니다.
+        :param landmark_sequence: 랜드마크 데이터의 numpy 배열
+        :return: (예측된 클래스 레이블, 신뢰도 점수) 튜플
         """
-        if not landmark_sequence:
-            return "랜드마크 데이터가 없습니다."
+        # NumPy 배열의 유효성을 올바르게 확인합니다.
+        if landmark_sequence is None or landmark_sequence.size == 0:
+            return "랜드마크 데이터가 없습니다.", 0.0
 
-        # 리스트를 numpy 배열로 변환
-        landmarks_np = np.array(landmark_sequence, dtype=np.float32)
+        # landmark_sequence가 이미 numpy 배열이라고 가정하고 타입 변환
+        landmarks_np = landmark_sequence.astype(np.float32)
 
         # 입력 데이터 전처리 (정규화, 크기 조절 등)
         # TODO: 학습 시 사용했던 전처리 과정을 여기에 동일하게 적용해야 합니다.
         # 예: landmarks_np = (landmarks_np - mean) / std
         
+        # 입력 데이터 크기 조절 (패딩/자르기)
+        num_frames = landmarks_np.shape[0]
+        max_frames = 300 # 학습 시 사용한 max_frames와 동일해야 함
+        if num_frames < max_frames:
+            pad_size = max_frames - num_frames
+            # 패딩 배열의 데이터 타입도 float32로 명시하여 타입 불일치 문제를 방지합니다.
+            landmarks_np = np.vstack([
+                landmarks_np,
+                np.zeros((pad_size, landmarks_np.shape[1]), dtype=np.float32)
+            ])
+        elif num_frames > max_frames:
+            landmarks_np = landmarks_np[:max_frames]
+
         # 모델 입력 형태에 맞게 텐서로 변환 (batch_size=1)
         input_tensor = torch.from_numpy(landmarks_np).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
             outputs = self.model(input_tensor)
-            _, predicted_idx = torch.max(outputs, 1)
-            
+            # Softmax를 적용하여 확률 계산
+            probabilities = torch.softmax(outputs, dim=1)
+            # 가장 높은 확률(점수)과 해당 인덱스(예측)를 가져옴
+            score, predicted_idx = torch.max(probabilities, 1)
+
         predicted_label = self.class_labels.get(predicted_idx.item(), "알 수 없는 기호")
         
-        return predicted_label
+        return predicted_label, score.item()
 
 def get_predictor():
     """Predictor 인스턴스를 생성하여 반환하는 팩토리 함수"""
@@ -135,12 +220,12 @@ def get_predictor():
     if not model_path.exists():
         raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
 
-    # TODO: num_classes, sequence_length, input_size를 실제 모델에 맞게 조정
+    # Predictor 생성 시 num_classes 인자를 제거합니다.
+    # 클래스 개수는 체크포인트에서 직접 읽어오기 때문입니다.
     predictor = Predictor(
         model_path=str(model_path),
-        num_classes=10,      # 예시: 10개의 수어 단어
-        sequence_length=300,  # 예시: 30프레임
-        input_size=147       # 랜드마크 추출기(147D)에 맞게 수정
+        sequence_length=300,
+        input_size=147
     )
     return predictor
 
@@ -151,11 +236,11 @@ if __name__ == '__main__':
         predictor = get_predictor()
         
         # 더미 데이터 생성 (batch=1, sequence_length=30, input_size=147)
-        dummy_input = np.random.rand(30, 147).tolist()
+        dummy_input = np.random.rand(30, 147)
 
-        prediction = predictor.predict(dummy_input)
-        print(f"🚀 더미 데이터 예측 결과: {prediction}")
-        
+        prediction, score = predictor.predict(dummy_input)
+        print(f"🚀 더미 데이터 예측 결과: {prediction} (Score: {score:.4f})")
+
         print("Predictor 모듈 테스트 성공.")
     except Exception as e:
         print(f"❌ Predictor 모듈 테스트 실패: {e}")

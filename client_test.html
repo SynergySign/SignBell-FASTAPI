@@ -48,7 +48,8 @@
   <legend>파라미터</legend>
   <div class="row"><label for="interval">Frame Interval(ms)</label><input id="interval" type="number" value="33" min="33" step="1" /></div>
   <div class="row"><label for="quality">JPEG Quality (0~1)</label><input id="quality" type="number" value="0.7" min="0.05" max="1" step="0.05" /></div>
-  <div class="row"><label for="targetFrames">Target Frames</label><input id="targetFrames" type="number" value="300" min="1" step="1" /></div>
+  <div class="row"><label for="collectionTime">Collection Time (s)</label><input id="collectionTime" type="number" value="5.0" min="1" step="0.1" /></div>
+  <div class="row"><label for="maxFrames">Max Frames (Safety)</label><input id="maxFrames" type="number" value="300" min="1" step="1" /></div>
   <div class="row"><button id="btnLoadConfig">서버 /config 반영</button></div>
 </fieldset>
 
@@ -105,7 +106,8 @@
   const btnLoadConfig = document.getElementById('btnLoadConfig');
   const intervalInput = document.getElementById('interval');
   const qualityInput = document.getElementById('quality');
-  const targetFramesInput = document.getElementById('targetFrames');
+  const collectionTimeInput = document.getElementById('collectionTime');
+  const maxFramesInput = document.getElementById('maxFrames');
 
   const video = document.getElementById('video');
   const canvas = document.getElementById('canvas');
@@ -121,6 +123,7 @@
   let dc = null;
   let ws = null;
   let captureTimer = null;
+  let stopTimer = null; // 캡처 자동 중지 타이머
   let startTs = 0;
   let sentFrames = 0;
   let totalBytes = 0;
@@ -194,6 +197,10 @@
           btnDisconnect.disabled = false;
         } else if(msg.type === 'inference_result'){ // 'result' 대신 'inference_result'를 사용하도록 수정
           log('Inference 결과 수신: '+ JSON.stringify(msg.data));
+          // 추론 완료 후 리셋 준비
+          setStatus('inference_done');
+          log('추론 완료. 1초 후 다음 캡처를 위해 리셋합니다.');
+          setTimeout(resetForNextCapture, 1000);
         } else if(msg.type === 'error'){
           log('Server Error: '+ msg.error,'err');
         } else if(msg.action === 'pong'){
@@ -251,15 +258,17 @@
       canvas.toBlob(async (blob) => {
         if(!blob) { scheduleNext(); return; }
         const arr = new Uint8Array(await blob.arrayBuffer());
-        if(dc && dc.readyState === 'open'){
+        if(dc && dc.readyState === 'open' && !stopped){
           dc.send(arr);
           sentFrames++;
           totalBytes += arr.byteLength;
           lastBytesEl.textContent = arr.byteLength;
           updateStats();
-          const target = parseInt(targetFramesInput.value,10) || 300;
-          if(sentFrames >= target){
-            log('목표 프레임 도달. 전송 중지 대기.');
+
+          // 안전장치: 최대 프레임 수 도달 시 중지
+          const maxFrames = parseInt(maxFramesInput.value,10) || 300;
+          if(sentFrames >= maxFrames){
+            log('최대 프레임(안전장치) 도달. 전송 중지.');
             stopCapture(false); // keep connection for result
           } else {
             scheduleNext();
@@ -283,18 +292,38 @@
     startTs = performance.now();
     btnStart.disabled=true;
     btnStop.disabled=false;
+
+    // 설정된 시간 후에 자동으로 캡처를 중지하는 타이머 설정
+    const collectionTime = parseFloat(collectionTimeInput.value) || 5.0;
+    log(`캡처 시작. ${collectionTime}초 후에 자동으로 중지됩니다.`);
+    stopTimer = setTimeout(() => {
+        log('설정된 시간 도달. 전송 중지 및 추론 요청.');
+        stopCapture(false); // 수동 중지가 아님
+    }, collectionTime * 1000);
+
     captureFrame();
     setStatus('capturing');
-    log('캡처 시작');
   }
 
   function stopCapture(manual=true){
+    if (stopped) return; // 중복 호출 방지
     stopped = true;
     if(captureTimer){ clearTimeout(captureTimer); captureTimer=null; }
+    if(stopTimer){ clearTimeout(stopTimer); stopTimer=null; } // 자동 중지 타이머도 클리어
     btnStop.disabled=true;
-    btnStart.disabled=false;
-    if(manual) log('캡처 중지');
-    if(manual) setStatus('connected');
+
+    // 수동으로 중지할 때만 Start 버튼을 즉시 활성화
+    if (manual && dc && dc.readyState === 'open') {
+        btnStart.disabled = false;
+    }
+
+    if(manual) {
+      log('캡처 수동 중지');
+      setStatus('connected');
+    } else {
+      // 자동 중지 시 flush 신호 전송
+      flush();
+    }
   }
 
   function flush(){
@@ -304,13 +333,28 @@
     }
   }
 
+  function resetForNextCapture() {
+    if (dc && dc.readyState === 'open') {
+        dc.send('reset');
+        log('서버에 리셋 신호 전송');
+        btnStart.disabled = false;
+        setStatus('connected');
+        log('준비 완료. 다시 캡처를 시작할 수 있습니다.');
+    }
+  }
+
   async function loadConfig(){
     try {
       const r = await fetch('/config');
       if(!r.ok) throw new Error('http '+ r.status);
       const cfg = await r.json();
-      targetFramesInput.value = cfg.target_frame_count;
-      log('서버 config 적용: target='+ cfg.target_frame_count);
+      if(cfg.collection_duration_seconds) {
+        collectionTimeInput.value = cfg.collection_duration_seconds;
+      }
+      if(cfg.max_frames_to_collect) {
+        maxFramesInput.value = cfg.max_frames_to_collect;
+      }
+      log(`서버 config 적용: CollectionTime=${collectionTimeInput.value}s, MaxFrames=${maxFramesInput.value}`);
     } catch(e){
       log('/config 로드 실패: '+ e,'err');
     }
