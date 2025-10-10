@@ -1,164 +1,108 @@
 # SignSense Test Server
 
-FastAPI + WebSocket(WebRTC 시그널링) + aiortc(DataChannel) 기반 수어 인식 프로토타입 서버.
-수신한 프레임 시퀀스를 더미 추론(`dummy_infer`)으로 처리하여 랜덤 라벨을 반환합니다.
+FastAPI + WebSocket(WebRTC 시그널링) + aiortc(DataChannel) 기반 수어 인식 프로토타입 서버입니다.
+브라우저에서 DataChannel로 전송한 프레임 시퀀스를 수집하여 (현재는 예비 더미 추론 또는 모델 추론)을 수행합니다.
 
-## 개발 진행 현황
-상세 진행 상황 / 로드맵은 `docs/개발진행현황.md` 문서를 참조하세요.
+요약
+- 서버 엔트리: `main.py` (WebSocket 시그널링 + DataChannel 프레임 수집, Predictor 로드)
+- 테스트 클라이언트: `client_test.html` (브라우저에서 카메라 캡처 → JPEG → DataChannel 전송)
+- 모델 위치: `models/` (예: `cnn_bilstm_attention_model.pth` 포함)
+- 전처리/추론 유틸: `processing/` (`landmark_extractor.py`, `predictor.py`)
+- 의존성: `requirements.txt`
 
-▶ 테스트/검증 절차와 명령어는 `docs/테스트가이드.md` 에 정리되어 있습니다.
+중요 변경/현황 (코드 기준)
+- 기본 수집/모델 입력 프레임 길이(TARGET_FRAME_COUNT): 300 (환경변수 `SIGN_SEQUENCE_TARGET_FRAMES`로 오버라이드 가능)
+- 수집 기준 시간: 환경변수 `SIGN_SEQUENCE_COLLECTION_SECONDS` 또는 기본 5.0초
+- 모델 파일 샘플: `models/cnn_bilstm_attention_model.pth` (레포에 포함되어 있음)
 
-## 구성 요소
-- `main.py`: 서버 엔트리. 모델 로딩 스텁 + WebSocket 시그널링 + DataChannel 프레임 수집.
-- `client_test.html`: 브라우저(WebRTC) 테스트용 프론트엔드. 카메라 캡처 → JPEG 변환 → DataChannel 전송.
-- `models/`: (선택) PyTorch / ONNX 모델 파일 위치.
-- `docs/`: 모델 로딩 방식, 반응 속도 테스트 설계 문서.
-- `requirements.txt`: 필수/선택 패키지 목록.
-
-## 설치 & 실행 (Windows 예시)
-```bash
+설치 및 실행 (Windows - cmd.exe 예시)
+1) 가상환경 생성 및 활성화
+```
 python -m venv .venv
 .venv\Scripts\activate
+```
+2) 의존성 설치
+```
 pip install --upgrade pip
 pip install -r requirements.txt
-# (GPU / 실제 추론 필요시) pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+참고: `torch`는 플랫폼/하드웨어(예: CUDA 버전)에 따라 별도로 설치 권장합니다. 예:
+```
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+3) 서버 실행 (HTTP, 개발용)
+```
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
-
-## 엔드포인트
-| 경로 | 메서드 | 설명 |
-|------|--------|------|
-| `/` | GET | 상태 확인 + 목표 프레임 수 |
-| `/health` | GET | 헬스 체크 |
-| `/model/status` | GET | 모델 로딩 상태 (더미/실제) |
-| `/config` | GET | (클라이언트 구동 참고) 목표 프레임 / 라벨 목록 |
-| `/client` | GET | 테스트 클라이언트 HTML 로드 |
-| `/ws` | WS | WebRTC 시그널링 (Offer/Answer, DataChannel 프레임 처리) |
-| `/simulate/predict` | POST | 더미 프레임으로 즉시 추론 (성능 측정 용이) |
-
-## WebRTC 시그널링 & DataChannel 흐름
-1. 브라우저 `client_test.html`에서 RTCPeerConnection 생성 후 Offer SDP 로컬 생성.
-2. ICE Gathering complete 시 `/ws` WebSocket에 `{action:'offer', sdp}` 전송.
-3. 서버가 Answer 생성 후 `{action:'answer', sdp}` 반환.
-4. DataChannel(`frames`) 오픈.
-5. 브라우저가 주기적(Frame Interval)으로 JPEG Blob → ArrayBuffer 변환 → DataChannel 전송.
-6. 서버는 `TARGET_FRAME_COUNT` 도달하면 더미 추론 후 WebSocket 으로 `{type:'result'}` JSON 응답.
-
-(현재 Trickle ICE 미사용: Answer 전송 시 SDP 에 후보 ICE 포함)
-
-## 테스트 클라이언트 사용
-1. 서버 실행 후 브라우저에서: `http://localhost:8000/client` 접속.
-2. `Connect` 클릭 → WebSocket + WebRTC 연결 → DataChannel open 로그 확인.
-3. `Start Capture` 클릭 → 프레임 전송 시작.
-4. 목표 프레임(기본 60) 도달 후 서버 추론 결과 수신.
-5. 필요 시 `Flush(강제결과)` 버튼으로 조기 처리.
-
-### 파라미터
-- Frame Interval(ms): 전송 간격 (Latency vs Bandwidth 트레이드오프 조절)
-- JPEG Quality: 전송 크기 최적화 (0.6~0.8 권장)
-- Target Frames: 시퀀스 길이 (실 운용 계획 9~10초 ≈ FPS * seconds)
-
-## HTTPS (로컬 개발)
-WebRTC 영상/카메라 접근은 HTTPS 가 권장됩니다.
-`mkcert` 로 인증서 발급 후:
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8443 \
-  --ssl-keyfile .cert/key.pem --ssl-certfile .cert/cert.pem
+HTTPS 로컬 테스트(권장: WebRTC/카메라 관련 기능 테스트 시)
+- 프로젝트에 인증서가 있는 경우(`certs/cert.pem`, `certs/key.pem`), `main.py`는 이를 자동으로 감지하고 HTTPS로 실행합니다.
+- 수동 실행 예 (cmd.exe에서 줄바꿈 시 \로 연결하지 않아도 괜찮음):
+```
+uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs\key.pem --ssl-certfile certs\cert.pem
 ```
 
-## 실제 모델 통합 TODO
-| 항목 | 설명 | 우선순위 |
-|------|------|----------|
-| MediaPipe 파이프라인 | Landmark 추출 + 좌표 normalization | High |
-| 전처리 유닛 | Landmark → 시퀀스 텐서 변환 | High |
-| Torch / ONNX 런타임 | CPU/GPU 선택, 세션 캐싱 | High |
-| Chunking 프로토콜 | 헤더(순번, 길이, 종료) 정의 → 재조립 안정화 | Medium |
-| 성능 모니터링 | 처리 시간(추론, 수신), 메모리, fps | Medium |
-| 에러/타임아웃 | 프레임 누락, DataChannel 끊김 처리 | Medium |
-| TURN 서버 | NAT traversal 안정화 (coturn) | Medium |
+주의: `mkcert` 등으로 로컬 인증서를 발급해 `certs/`에 넣어 사용하세요.
 
-## 실시간 랜드마크 전처리 (훈련 coordinate_extractor 재현)
-환경 변수 `SIGN_EXTRACT_LANDMARKS=1` 로 활성화할 수 있는 선택 기능입니다. 활성화 시 `dummy_infer` 이전에 프레임 바이트 배열을 MediaPipe Holistic 으로 처리하여 학습 시 사용한 특징 구조(추정)를 재현하려 합니다.
+핵심 엔드포인트
+- GET /              : 상태 확인
+- GET /health        : 헬스 체크 (predictor 로드 상태 확인)
+- GET /model/status  : 모델 로드 상태, 경로, 디바이스 정보
+- GET /config        : 서버 기본 설정(TARGET_FRAME_COUNT, collection duration 등)
+- GET /client        : 테스트용 HTML 페이지 (`client_test.html`) 반환
+- WS  /ws/{session}  : WebSocket 시그널링(Offer/Answer) — 브라우저와 서버 간 시그널링 통신
+- POST /simulate/predict : 더미 프레임으로 동작하는 REST 추론 시뮬레이터 (성능 측정용)
 
-### 특징 구성 (Frame Feature Vector)
-- Pose 상체 관절 6개: indices (11,12,13,14,15,16)
-- Left Hand: MediaPipe Hands 21 포인트 (wrist 포함)
-- Right Hand: MediaPipe Hands 21 포인트 (wrist 포함)
-- 양 손목 간 상대 3D 벡터 1개 (Right - Left)
-- 총 포인트: 49 → 각 (x,y,z) → 49 * 3 = 147 차원
+WebRTC 시그널링 & DataChannel 동작 요약
+1. 브라우저(`client_test.html`)에서 RTCPeerConnection 생성 후 Offer 생성
+2. ICE Gathering 완료 시 WebSocket `/ws/{session}`에 `{action: 'offer', sdp, type}` 전송
+3. 서버는 Answer 생성하여 `{type: 'answer', sdp}` 반환 (현재 트리클 ICE 미사용: Answer에 후보 포함)
+4. DataChannel(label='frames') 오픈되면 브라우저가 JPEG Blob → ArrayBuffer로 변환하여 전송
+5. 서버는 `SequenceCollector`로 프레임을 수집. 기본 기준은 collection duration(기본 5s) 또는 수집된 프레임 개수(안전 상한)
+6. 수집 완료 혹은 클라이언트의 `flush` 명령 수신 시 `run_inference`를 호출하여 랜드마크 추출 → (모델)추론 → WebSocket으로 `inference_result` 전송
 
-### 정규화 / 스케일링 규칙
-1. 안정 중심(stable_center) = ((좌/우 어깨 평균) + 코) / 2
-2. 모든 pose/손목 좌표: `(coord - stable_center) / 0.3`
-3. Pose Z, 손목 Z: 추가 감쇠 계수 0.7
-4. 손가락 포인트: 손목 기준 상대좌표 `(finger - wrist)/0.3`, Z 감쇠 0.6
-5. 양 손목 모두 검출 시 손목 간 (dx,dy,dz) 추가, 아니면 (0,0,0)
-6. 누락된 손 또는 포인트는 0 패딩
+클라이언트 테스트 사용법
+1. 서버 실행
+2. 브라우저에서 `https://localhost:8000/client` 접속
+3. Connect → 브라우저 권한으로 카메라 접근 허용 → DataChannel이 열리면 Start Capture 클릭
+4. Capture가 끝나면 서버로부터 추론 결과를 수신
+5. 필요 시 Flush(강제추론) 또는 Reset(다음 캡처 준비) 사용
 
-> 주의: 실제 학습에 사용된 원본 `coordinate_extractor` 와 완전 일치 보장을 위해서는 학습 스크립트의 원본 코드를 대조해야 합니다. 현재 구현은 일반적인 수어 포즈 정규화 패턴과 제공된 설명을 기반으로 한 추정입니다.
+프레임/랜드마크 전처리
+- `processing/landmark_extractor.py`에 실시간 랜드마크 추출 로직이 구현되어 있습니다. MediaPipe Holistic을 사용하여 다음 특징 벡터(프레임당 147차원)를 생성합니다.
+  - Pose 6개(인덱스 11~16), 좌/우 손 21포인트, 손목 간 상대 벡터 등 → 총 49 포인트 × 3 = 147 차원
+- `SIGN_EXTRACT_LANDMARKS=1` 등의 환경변수로 활성화하여 서버 측에서 프레임 → 랜드마크 처리를 수행할 수 있습니다.
 
-### skip_missing 옵션
-`RealtimeLandmarkExtractor(skip_missing=...)`
-- `True`: Pose 가 검출되지 않는 프레임은 특징에서 제외 (학습 때 동일 동작이면 선택)
-- `False`(기본): 0 벡터를 유지하여 시퀀스 길이 고정에 유리
+모델 & Predictor
+- 모델 로드: `processing/predictor.py`의 `get_predictor()`가 `models/cnn_bilstm_attention_model.pth`를 로드합니다.
+- 모델이 없으면 `get_predictor()`는 FileNotFoundError를 발생시키므로 배포/테스트 전에 모델 파일 존재를 확인하세요.
+- 샘플 모델 구조: `CNN_BiLSTM_Attention` (predictor에서 정의)
 
-### Enable 방법 (Windows 예)
-```bash
-set SIGN_EXTRACT_LANDMARKS=1
-uvicorn main:app --reload
+의존성 (요약)
+- 필수: fastapi, uvicorn, aiortc, python-multipart
+- ML/영상: torch, numpy, mediapipe, opencv-python, Pillow
+- 테스트: httpx (smoke_test.py)
+자세한 버전은 `requirements.txt`를 확인하세요.
+
+간단 스모크 테스트
+- REST 엔드포인트 동작 확인(비-RTC 환경에서도 가능):
 ```
-
-### 추가 설치 필요 패키지
-`requirements.txt` 에 주석 처리된 항목을 설치:
-```bash
-pip install mediapipe==0.10.11 opencv-python numpy
-```
-(GPU 추론이 필요하다면 별도로 torch 설치)
-
-### 응답 예시 (`/simulate/predict` 또는 WebSocket 결과 내 inference.landmarks)
-```json
-{
-  "predicted": "안녕하세요",
-  "score": 0.91,
-  "landmarks": {
-    "enabled": true,
-    "seq_shape": [60,147],
-    "feature_dim": 147
-  }
-}
-```
-오류/비활성화 시:
-```json
-"landmarks": { "enabled": false }
-```
-또는 `{ "enabled": true, "error": "..." }` 형식.
-
-### 차후 개선 포인트
-- 학습 원본 코드 비교 후 damping 계수/scale 재조정
-- visibility / handedness 추가 여부 결정
-- outlier smoothing (EMA) / temporal interpolation
-- 성능 최적화를 위한 MediaPipe GPU delegate 고려
-
-## 더미 추론 구조
-`dummy_infer(frames)`:
-- 50ms sleep 모의 지연
-- 라벨 랜덤 선택 + 0.75~0.99 점수
-- 사용 프레임 수 / 시간 메타데이터 포함
-
-## 간단 스모크 테스트
-환경: aiortc 미설치 상태에서도 비추론 REST 는 동작.
-```bash
 python smoke_test.py
 ```
+- WebRTC(DataChannel) 기능을 테스트하려면 브라우저에서 `/client`를 사용하세요. aiortc가 설치되어 있지 않으면 WebRTC 시그널링/데이터채널은 동작하지 않습니다.
 
-## 개발 편의
-- 환경 변수 `SIGN_SEQUENCE_TARGET_FRAMES` 로 수집 프레임 수 변경 가능.
-- 에디터 경고(IDE) 중 aiortc 관련 객체 호출 불가 경고는 패키지 설치 시 해소.
+디버깅 / 자주 묻는 문제
+- SSL 인증서가 없으면 `main.py`가 자동으로 HTTP로 실행됩니다. WebRTC의 카메라 권한/HTTPS 동작을 테스트하려면 로컬 인증서를 준비하세요.
+- 모델 로드 에러: `processing/predictor.py`에서 모델 경로(`models/cnn_bilstm_attention_model.pth`)가 존재하는지, checkpoint의 키(`model_state_dict` 등)가 적절한지 확인하세요.
+- MediaPipe/Opencv import 오류: 해당 패키지 설치 필요. 실시간 랜드마크 추출은 추가 패키지 설치가 필요합니다.
 
-## 라이선스
-내부 PoC 단계 (라이선스 미지정). 배포 전 명시 필요.
+TODO / 향후 작업
+- 학습 원본 코드와 coordinate_extractor 비교 후 정밀 보정
+- Chunking(프레임 헤더/순번) 프로토콜 안정화
+- TURN 서버(coturn) 연동
+- 성능 모니터링 (latency, 메모리, fps)
 
-## 차후 확장 아이디어
-- DataChannel 과 별개로 WebRTC 영상 Track 직접 수신 + 서버 측 프레임 디코딩
-- Frame Delta 전송(압축률 향상)
-- gRPC 스트리밍 대안 비교 벤치마킹
+라이선스
+- 현재 PoC 단계(라이선스 미지정). 배포 전 라이선스 명시 필요.
+
+참고 문서
+- `docs/개발진행현황.md`, `docs/테스트가이드.md`, `docs/모델로드방식.md` 등을 참고하세요.
