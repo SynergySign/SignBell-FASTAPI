@@ -188,9 +188,10 @@ class Predictor:
         max_frames = 300 # 학습 시 사용한 max_frames와 동일해야 함
         if num_frames < max_frames:
             pad_size = max_frames - num_frames
+            # 패딩 배열의 데이터 타입도 float32로 명시하여 타입 불일치 문제를 방지합니다.
             landmarks_np = np.vstack([
                 landmarks_np,
-                np.zeros((pad_size, landmarks_np.shape[1]))
+                np.zeros((pad_size, landmarks_np.shape[1]), dtype=np.float32)
             ])
         elif num_frames > max_frames:
             landmarks_np = landmarks_np[:max_frames]
