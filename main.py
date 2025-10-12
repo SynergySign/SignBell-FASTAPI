@@ -67,107 +67,8 @@ app = FastAPI(title="SignSense Inference Server", version="0.2.0")
 
 # ----------------------------- Model & Inference Logic -----------------------------
 
-def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]:
-    """
-    수집된 프레임에 대해 랜드마크 추출 및 모델 추론을 수행합니다.
-    """
-    start = time.time()
-    landmarks_info: Dict[str, Any] = {}
-    predicted_label = "오류: 추론 실패"
-    score = 0.0
-
-    try:
-        # 1. 랜드마크 추출
-        if extract_sequence_from_frames is None:
-            raise RuntimeError("Landmark extractor not available (missing heavy dependencies)")
-
-        landmark_sequence = extract_sequence_from_frames(frames, target_len=TARGET_FRAME_COUNT, skip_missing=False)
-
-        # 2. 추출된 데이터 유효성 검사
-        if landmark_sequence is None or (hasattr(landmark_sequence, '__len__') and len(landmark_sequence) == 0):
-            landmarks_info = {"enabled": True, "error": "landmark_sequence is None or empty"}
-            predicted_label = "오류: 랜드마크를 감지하지 못했습니다."
-        elif np is not None and np.all(landmark_sequence == 0):
-            landmarks_info = {"enabled": True, "error": "All landmarks are zero (No detection)"}
-            predicted_label = "오류: 랜드마크를 감지하지 못했습니다. (데이터 없음)"
-        else:
-            # 3. 모델 추론
-            landmarks_info = {
-                "enabled": True,
-                "seq_shape": list(landmark_sequence.shape) if hasattr(landmark_sequence, 'shape') else None,
-                "feature_dim": FRAME_FEATURE_DIM,
-            }
-            # --- 데이터 타입 일치 오류 수정 ---
-            # predictor.predict에 전달하기 직전에 데이터 타입을 float32로 명시적으로 변환합니다.
-            if predictor is None:
-                raise RuntimeError("Predictor not available (missing heavy dependencies)")
-            landmark_sequence_float32 = landmark_sequence.astype(np.float32) if np is not None else landmark_sequence
-            predicted_label, score = predictor.predict(landmark_sequence_float32)
-
-    except Exception as e:
-        print(f"[ERROR] Exception during inference: {e}")
-        traceback.print_exc()
-        error_message = str(e)
-        landmarks_info = {"enabled": True, "error": error_message}
-        predicted_label = f"오류: 추론 중 예외 발생 ({error_message})"
-
-    end = time.time()
-    return {
-        "predicted": predicted_label,
-        "score": score,
-        "inference_start": start,
-        "inference_end": end,
-        "inference_ms": int((end - start) * 1000),
-        "frames_used": len(frames),
-        "landmarks": landmarks_info,
-    }
-
-
-# ----------------------------- Sequence Collector -----------------------------
-
-@dataclass
-class SequenceCollector:
-    frames: List[bytes] = field(default_factory=list)
-    start_ts: Optional[float] = None
-    processed: bool = False
-
-    def start_collection(self):
-        """수집 타이머를 시작합니다."""
-        if self.start_ts is None:
-            self.start_ts = time.time()
-
-    def add_frame(self, data: bytes):
-        """
-        수집 기간 내에 있고 최대 프레임 수를 초과하지 않은 경우에만 프레임을 추가합니다.
-        """
-        # 추론이 시작되었다면 더 이상 프레임을 추가하지 않습니다.
-        if self.processed:
-            return
-
-        if self.start_ts is not None and not self.is_full():
-            # 메모리 폭주를 방지하기 위한 안전장치
-            if len(self.frames) < MAX_FRAMES_TO_COLLECT:
-                self.frames.append(data)
-
-    def is_full(self) -> bool:
-        """수집 시간이 다 되었는지 확인합니다."""
-        if self.start_ts is None:
-            return False
-
-        time_elapsed = time.time() - self.start_ts
-        # 시간 조건만으로 수집 종료를 결정합니다.
-        return time_elapsed >= COLLECTION_DURATION_SECONDS
-
-    def build_timings(self) -> Dict[str, Any]:
-        end_ts = time.time()
-        return {
-            "frame_count": len(self.frames),
-            "receive_first_ts": self.start_ts,
-            "receive_last_ts": end_ts,
-            "receive_duration_ms": None if self.start_ts is None else int(
-                (end_ts - self.start_ts) * 1000
-            ),
-        }
+# Use the shared inference pipeline implementation (separated module)
+from inference_pipeline import run_inference, SequenceCollector, schedule_quiz_save
 
 
 # ----------------------------- Global State -----------------------------
@@ -333,6 +234,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 "type": "inference_result",
                 "data": result
             })
+
+            # 비동기 백그라운드로 퀴즈 저장 스케줄 (외부 호출에 영향을 주지 않도록 비동기 처리)
+            try:
+                import asyncio
+                asyncio.create_task(schedule_quiz_save(frames=collector.frames, inference_result=result, session_id=session_id))
+            except Exception as e:
+                print(f"[WS][WARN] Failed to schedule quiz save: {e}")
 
         @channel.on("message")
         async def on_message(message):
