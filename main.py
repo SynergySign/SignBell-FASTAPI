@@ -193,6 +193,26 @@ async def simulate_predict():
     return result
 
 
+@app.post("/simulate/create-collector")
+async def simulate_create_collector(request: Request):
+    """Test helper: create an empty SequenceCollector for given session_id.
+    Body JSON: {"session_id": str}
+    This endpoint is only intended for local testing (smoke_test).
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    session_id = payload.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    # Create a collector (empty) for session
+    collector = app.state.ss.new_collector(session_id)
+    return {"ok": True, "session_id": session_id, "collector_frames": len(collector.frames)}
+
+
 # ----------------------------- Internal storage endpoints -----------------------------
 
 def _check_internal_access(request: Request):

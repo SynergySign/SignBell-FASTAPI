@@ -9,11 +9,13 @@ aiortc 설치 여부와 무관하게 동작 가능한 기본 REST 엔드포인�
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import httpx
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.getenv("SMOKE_BASE_URL", "http://127.0.0.1:8000")
+TOKEN = os.getenv("INTERNAL_API_TOKEN")
 
 
 def pretty(obj: Any) -> str:
@@ -21,6 +23,13 @@ def pretty(obj: Any) -> str:
         return json.dumps(obj, indent=2, ensure_ascii=False)
     except Exception:
         return str(obj)
+
+
+def auth_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    return headers
 
 
 def check(path: str, method: str = "GET"):
@@ -44,6 +53,7 @@ def check(path: str, method: str = "GET"):
 
 def main():
     print("=== SignSense REST Smoke Test ===")
+    print(f"BASE={BASE} TOKEN={'SET' if TOKEN else 'NONE'}")
     for path, method in [
         ("/", "GET"),
         ("/health", "GET"),
@@ -63,7 +73,7 @@ def main():
         r = httpx.post(BASE + "/internal/save-quiz", json={
             "session_id": "testsession",
             "inference_result": {"predicted": "테스트", "score": 0.5}
-        }, timeout=10)
+        }, headers=auth_headers(), timeout=10)
         print(f"/internal/save-quiz -> {r.status_code}")
         try:
             print(pretty(r.json()))
@@ -73,12 +83,25 @@ def main():
         print(f"[ERR] /internal/save-quiz: {e}")
     print("-" * 60)
 
+    # Ensure a collector exists for the learning save test
+    try:
+        print("[POST] /simulate/create-collector (for testsession)")
+        r = httpx.post(BASE + "/simulate/create-collector", json={"session_id": "testsession"}, timeout=5)
+        print(f"/simulate/create-collector -> {r.status_code}")
+        try:
+            print(pretty(r.json()))
+        except Exception:
+            print(r.text[:200])
+    except Exception as e:  # noqa
+        print(f"[ERR] /simulate/create-collector: {e}")
+    print("-" * 60)
+
     try:
         print("[POST] /internal/save-learning")
         r = httpx.post(BASE + "/internal/save-learning", json={
             "session_id": "testsession",
             "meta": {"label": "안녕", "source": "smoke_test"}
-        }, timeout=10)
+        }, headers=auth_headers(), timeout=10)
         print(f"/internal/save-learning -> {r.status_code}")
         try:
             print(pretty(r.json()))
