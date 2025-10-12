@@ -57,6 +57,37 @@ def main():
         except Exception as e:  # noqa
             print(f"[ERR] {path}: {e}")
 
+    # === Internal endpoints (require JSON bodies) ===
+    try:
+        print("[POST] /internal/save-quiz")
+        r = httpx.post(BASE + "/internal/save-quiz", json={
+            "session_id": "testsession",
+            "inference_result": {"predicted": "테스트", "score": 0.5}
+        }, timeout=10)
+        print(f"/internal/save-quiz -> {r.status_code}")
+        try:
+            print(pretty(r.json()))
+        except Exception:
+            print(r.text[:200])
+    except Exception as e:  # noqa
+        print(f"[ERR] /internal/save-quiz: {e}")
+    print("-" * 60)
+
+    try:
+        print("[POST] /internal/save-learning")
+        r = httpx.post(BASE + "/internal/save-learning", json={
+            "session_id": "testsession",
+            "meta": {"label": "안녕", "source": "smoke_test"}
+        }, timeout=10)
+        print(f"/internal/save-learning -> {r.status_code}")
+        try:
+            print(pretty(r.json()))
+        except Exception:
+            print(r.text[:200])
+    except Exception as e:  # noqa
+        print(f"[ERR] /internal/save-learning: {e}")
+    print("-" * 60)
+
     print("완료. WebSocket /ws 및 WebRTC 흐름은 브라우저 /client 에서 수동 확인 필요.")
 
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse
 
 # --- Core Dependencies ---
@@ -192,6 +192,88 @@ async def simulate_predict():
     result = run_inference(predictor, dummy_frames)
     return result
 
+
+# ----------------------------- Internal storage endpoints -----------------------------
+
+def _check_internal_access(request: Request):
+    """Optional internal access guard.
+    If ENV INTERNAL_API_TOKEN is set, require header 'x-internal-token' to match.
+    Otherwise allow requests from localhost addresses.
+    """
+    token = os.getenv("INTERNAL_API_TOKEN")
+    if token:
+        hdr = request.headers.get("x-internal-token")
+        if hdr != token:
+            raise HTTPException(status_code=403, detail="Forbidden: invalid internal token")
+    else:
+        # If no token configured, allow only local requests as a reasonable default.
+        client = request.client
+        if client is None or client.host not in ("127.0.0.1", "::1", "localhost"):
+            # Not strictly secure in all deployments, but suitable for local/intra-host calls.
+            raise HTTPException(status_code=403, detail="Forbidden: internal endpoint only")
+
+
+@app.post("/internal/save-learning")
+async def internal_save_learning(request: Request):
+    """Internal endpoint to save collected frames for a session as 'learning' data.
+    Body JSON: { "session_id": str, "meta": { ... } }
+    This schedules an async save and returns immediately.
+    """
+    _check_internal_access(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    session_id = payload.get("session_id")
+    meta = payload.get("meta", {})
+
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    collector = app.state.ss.collectors.get(session_id)
+    if collector is None:
+        raise HTTPException(status_code=404, detail="collector not found for session_id")
+
+    frames = collector.frames
+
+    try:
+        # schedule async save_learning
+        from storage.s3_db_saver import save_learning
+        import asyncio
+        asyncio.create_task(save_learning(frames=frames, meta={**meta, "session_id": session_id}))
+        return {"ok": True, "scheduled": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to schedule save_learning: {e}")
+
+
+@app.post("/internal/save-quiz")
+async def internal_save_quiz(request: Request):
+    """Internal endpoint to save quiz inference results. Body JSON: { "session_id": str, "inference_result": {...} }
+    The endpoint will look up frames for session_id (if available) and schedule async save_quiz.
+    """
+    _check_internal_access(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    session_id = payload.get("session_id")
+    inference_result = payload.get("inference_result")
+
+    if not session_id or inference_result is None:
+        raise HTTPException(status_code=400, detail="session_id and inference_result are required")
+
+    collector = app.state.ss.collectors.get(session_id)
+    frames = collector.frames if collector is not None else []
+
+    try:
+        from storage.s3_db_saver import save_quiz
+        import asyncio
+        asyncio.create_task(save_quiz(frames=frames, inference_result=inference_result, session_id=session_id))
+        return {"ok": True, "scheduled": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to schedule save_quiz: {e}")
 
 # ----------------------------- WebSocket Signaling -----------------------------
 
