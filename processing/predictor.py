@@ -123,6 +123,11 @@ class Predictor:
         """
         모델을 로드하고 추론을 준비합니다.
         """
+        # 새로 추가: 모델 경로 및 메타 정보 저장
+        self.model_path = str(model_path)
+        self.sequence_length = sequence_length
+        self.input_size = input_size
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"🤖 Predictor가 사용할 디바이스: {self.device}")
 

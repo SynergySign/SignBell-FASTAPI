@@ -5,7 +5,6 @@ SignSense Test Server
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
@@ -19,13 +18,42 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 # --- Core Dependencies ---
-# 이 라이브러리들은 서버의 핵심 기능이므로, 없는 경우 즉시 에러를 발생시키는 것이 타당합니다.
-import torch
-import numpy as np
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+# 일부 라이브러리는 개발환경에 설치되어 있지 않을 수 있으므로 안전하게 임포트합니다.
+HEAVY_IMPORTS_AVAILABLE = True
+try:
+    import torch
+    import numpy as np
+    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 
-from processing.predictor import Predictor, get_predictor, CNN_BiLSTM_Attention, PositionalEncoding
-from processing.landmark_extractor import extract_sequence_from_frames, FRAME_FEATURE_DIM
+    from processing.predictor import Predictor, get_predictor, CNN_BiLSTM_Attention, PositionalEncoding
+    from processing.landmark_extractor import extract_sequence_from_frames, FRAME_FEATURE_DIM
+except Exception as _e:
+    # 의존성이 없는 환경에서도 기본 REST 엔드포인트를 테스트할 수 있도록 예외를 무시하고
+    # 런타임에서 필요한 경우 명확한 에러를 발생시키도록 처리합니다.
+    print(f"[WARN] Optional heavy imports failed: {_e}")
+    HEAVY_IMPORTS_AVAILABLE = False
+
+    torch = None
+    np = None
+    # aiortc 관련 객체는 None으로 대체
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    RTCIceCandidate = None
+
+    # Predictor 등은 None / 더미로 대체 (get_predictor은 None을 반환하도록 설정)
+    Predictor = None
+
+    def get_predictor():
+        return None
+
+    CNN_BiLSTM_Attention = None
+    PositionalEncoding = None
+
+    def extract_sequence_from_frames(frames, target_len=None, skip_missing=False):
+        # 더미 구현: 실제 추론을 위해서는 mediapipe 등 의존성이 필요합니다.
+        return None
+
+    FRAME_FEATURE_DIM = 0
 
 
 # --- 상수 정의 ---
@@ -39,7 +67,7 @@ app = FastAPI(title="SignSense Inference Server", version="0.2.0")
 
 # ----------------------------- Model & Inference Logic -----------------------------
 
-def run_inference(predictor: Predictor, frames: List[bytes]) -> Dict[str, Any]:
+def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]:
     """
     수집된 프레임에 대해 랜드마크 추출 및 모델 추론을 수행합니다.
     """
@@ -50,25 +78,30 @@ def run_inference(predictor: Predictor, frames: List[bytes]) -> Dict[str, Any]:
 
     try:
         # 1. 랜드마크 추출
+        if extract_sequence_from_frames is None:
+            raise RuntimeError("Landmark extractor not available (missing heavy dependencies)")
+
         landmark_sequence = extract_sequence_from_frames(frames, target_len=TARGET_FRAME_COUNT, skip_missing=False)
 
         # 2. 추출된 데이터 유효성 검사
-        if landmark_sequence is None or len(landmark_sequence) == 0:
+        if landmark_sequence is None or (hasattr(landmark_sequence, '__len__') and len(landmark_sequence) == 0):
             landmarks_info = {"enabled": True, "error": "landmark_sequence is None or empty"}
             predicted_label = "오류: 랜드마크를 감지하지 못했습니다."
-        elif np.all(landmark_sequence == 0):
+        elif np is not None and np.all(landmark_sequence == 0):
             landmarks_info = {"enabled": True, "error": "All landmarks are zero (No detection)"}
             predicted_label = "오류: 랜드마크를 감지하지 못했습니다. (데이터 없음)"
         else:
             # 3. 모델 추론
             landmarks_info = {
                 "enabled": True,
-                "seq_shape": list(landmark_sequence.shape),
+                "seq_shape": list(landmark_sequence.shape) if hasattr(landmark_sequence, 'shape') else None,
                 "feature_dim": FRAME_FEATURE_DIM,
             }
             # --- 데이터 타입 일치 오류 수정 ---
             # predictor.predict에 전달하기 직전에 데이터 타입을 float32로 명시적으로 변환합니다.
-            landmark_sequence_float32 = landmark_sequence.astype(np.float32)
+            if predictor is None:
+                raise RuntimeError("Predictor not available (missing heavy dependencies)")
+            landmark_sequence_float32 = landmark_sequence.astype(np.float32) if np is not None else landmark_sequence
             predicted_label, score = predictor.predict(landmark_sequence_float32)
 
     except Exception as e:
@@ -141,12 +174,37 @@ class SequenceCollector:
 
 class AppState:
     def __init__(self):
-        self.predictor: Predictor = get_predictor()
+        # Predictor는 heavy deps가 없으면 None이 됩니다.
         # --- 모델 로드 오류 해결 ---
-        # torch.load가 __main__에서 클래스를 찾으므로, 수동으로 매핑해줍니다.
-        sys.modules['__main__'].CNN_BiLSTM_Attention = CNN_BiLSTM_Attention
-        sys.modules['__main__'].PositionalEncoding = PositionalEncoding
-        self.active_peers: Dict[str, RTCPeerConnection] = {}
+        # torch.load가 unpickle 시 특정 모듈명 아래에서 클래스를 찾는 경우가 있어,
+        # 필요한 클래스들을 가능한 모듈 이름에 미리 주입한 뒤 모델을 로드합니다.
+        import types
+
+        def _inject_class_to_module(mod_name: str, cls_name: str, cls_obj):
+            if cls_obj is None:
+                return
+            mod = sys.modules.get(mod_name)
+            if mod is None:
+                # 가상 모듈을 만들어 sys.modules에 등록합니다.
+                mod = types.ModuleType(mod_name)
+                sys.modules[mod_name] = mod
+            setattr(mod, cls_name, cls_obj)
+
+        candidate_module_names = [
+            '__main__',
+            'uvicorn.__main__',
+            __name__,
+            'main',
+        ]
+
+        for mname in candidate_module_names:
+            _inject_class_to_module(mname, 'CNN_BiLSTM_Attention', CNN_BiLSTM_Attention)
+            _inject_class_to_module(mname, 'PositionalEncoding', PositionalEncoding)
+
+        # 위 주입이 완료된 이후에 predictor를 로드하도록 합니다.
+        self.predictor: Optional["Predictor"] = get_predictor() if HEAVY_IMPORTS_AVAILABLE else None
+
+        self.active_peers: Dict[str, "RTCPeerConnection"] = {}
         self.collectors: Dict[str, SequenceCollector] = {}
 
     def new_collector(self, session_id: str) -> SequenceCollector:
@@ -162,7 +220,7 @@ app.state.ss = AppState()
 
 @app.on_event("startup")
 async def startup_event():
-    """��버 시작 시 실제 추론 모델(Predictor)을 로드합니다."""
+    """서버 시작 시 실제 추론 모델(Predictor)을 로드합니다."""
     print("[STARTUP] Loading predictor...")
     try:
         # 상태 초기화 시 이미 로드되었으므로, 여기서는 확인만 합니다.
@@ -219,6 +277,19 @@ async def serve_client_test_page():
             content=f"<h1>404 Not Found</h1><p>client_test.html not found at {client_path}</p>"
         )
     return HTMLResponse(content=client_path.read_text(encoding="utf-8"), status_code=200)
+
+
+# === 시뮬레이터 엔드포인트: 스모크 테스트용 ===
+@app.post("/simulate/predict")
+async def simulate_predict():
+    """더미 프레임을 사용하여 run_inference 흐름을 검증하는 간단한 엔드포인트.
+    실제 프레임은 브라우저 DataChannel을 통해 전달되므로, 여기서는 고정 길이의 바이트 블록을 전달합니다.
+    """
+    predictor = app.state.ss.predictor
+    # 더미 프레임(바이트)을 생성합니다. 실제 환경에서는 JPEG 바이트 배열이 들어옵니다.
+    dummy_frames = [b"\x00"] * 10
+    result = run_inference(predictor, dummy_frames)
+    return result
 
 
 # ----------------------------- WebSocket Signaling -----------------------------
