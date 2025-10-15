@@ -121,20 +121,28 @@ app.state.ss = AppState()
 
 @app.on_event("startup")
 async def startup_event():
-    """서버 시작 시 실제 추론 모델(Predictor)을 로드합니다."""
-    print("[STARTUP] Loading predictor...")
+    """서버 시작 시 실제 추론 모델(Predictor)을 로드하려 시도합니다.
+    운영환경에서 aiortc/mediapipe/torch 등이 설치되어 있다면 `processing.predictor.get_predictor()`를 호출해
+    Predictor 인스턴스를 초기화합니다. 실패하면 에러를 로깅하고 predictor는 None으로 남겨둡니다.
+    """
+    print("[STARTUP] Attempting to load Predictor...")
+    # 이미 로드되어 있으면 재사용
+    if getattr(app.state.ss, 'predictor', None):
+        print("[STARTUP] Predictor already initialized.")
+        return
+
     try:
-        # 상태 초기화 시 이미 로드되었으므로, 여기서는 확인만 합니다.
-        if app.state.ss.predictor:
-            print("[STARTUP] Predictor ready.")
-        else:
-            # 이 경우는 get_predictor() 실패 시 발생
-            raise RuntimeError("Predictor could not be loaded.")
+        # 동적으로 Import 시도하여 실제 운영환경의 종속성을 사용할 수 있게 함
+        from processing.predictor import get_predictor as _get_predictor
+        predictor_instance = _get_predictor()
+        app.state.ss.predictor = predictor_instance
+        print("[STARTUP] Predictor successfully loaded.")
     except Exception as e:
-        print(f"[STARTUP][FATAL] Failed to load predictor: {e}")
-        # 필수 의존성이므로, 로드 실패 시 프로세스를 종료하거나 상태를 명확히 할 수 있습니다.
-        # 여기서는 에러 로그를 남기고, health check 등에서 감지되도록 합니다.
+        # 자세한 예외 정보 로그
+        print(f"[STARTUP][ERROR] Failed to load Predictor dynamically: {e}")
+        traceback.print_exc()
         app.state.ss.predictor = None
+        print("[STARTUP] Running without Predictor. Install required packages and restart the server for real inference.")
 
 
 # ----------------------------- REST Endpoints -----------------------------
@@ -160,6 +168,7 @@ async def model_status():
         "device": str(predictor.device) if predictor else "N/A",
     }
 
+
 @app.get("/config")
 async def get_config():
     return {
@@ -167,6 +176,7 @@ async def get_config():
         "collection_duration_seconds": COLLECTION_DURATION_SECONDS,
         "max_frames_to_collect": MAX_FRAMES_TO_COLLECT,
     }
+
 
 @app.get("/client", response_class=HTMLResponse)
 async def serve_client_test_page():
@@ -405,6 +415,36 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         if session_id in app.state.ss.collectors:
             del app.state.ss.collectors[session_id]
         print(f"[WS] Cleaned up resources for {peer_id} (session: {session_id})")
+
+
+# ----------------------------- Diagnostic Endpoints -----------------------------
+
+@app.post('/model/test-predict')
+async def model_test_predict():
+    """Diagnostic endpoint to verify Predictor.predict works with a random input.
+    Returns {'predicted': label, 'score': float} when predictor is available, otherwise 503.
+    """
+    predictor = app.state.ss.predictor
+    if predictor is None:
+        raise HTTPException(status_code=503, detail="Predictor not loaded")
+
+    # require numpy available
+    try:
+        import numpy as _np
+    except Exception:
+        raise HTTPException(status_code=503, detail="numpy not available on server")
+
+    # build dummy sequence matching expected feature dim
+    try:
+        feat_dim = FRAME_FEATURE_DIM if 'FRAME_FEATURE_DIM' in globals() else getattr(predictor, 'input_size', None)
+        if not feat_dim:
+            raise RuntimeError('Unknown feature dim')
+        seq_len = min(60, TARGET_FRAME_COUNT)
+        dummy = _np.random.rand(seq_len, int(feat_dim)).astype(_np.float32)
+        label, score = predictor.predict(dummy)
+        return { 'predicted': label, 'score': float(score) }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Predict failed: {e}")
 
 
 if __name__ == "__main__":
