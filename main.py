@@ -6,16 +6,18 @@ SignSense Test Server
 from __future__ import annotations
 
 import json
-import os
 import sys
-import time
 import traceback
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse
+from security.jwt_validator import validate_token_and_get_user_id
+
+from configs import settings
+from routers import internal as internal_router
+from routers import diagnostics as diagnostics_router
 
 # --- Core Dependencies ---
 # 일부 라이브러리는 개발환경에 설치되어 있지 않을 수 있으므로 안전하게 임포트합니다.
@@ -53,16 +55,32 @@ except Exception as _e:
         # 더미 구현: 실제 추론을 위해서는 mediapipe 등 의존성이 필요합니다.
         return None
 
-    FRAME_FEATURE_DIM = 0
+# 중앙 설정에서 값을 가져옵니다 (환경변수는 configs/settings.py에서 처리).
+TARGET_FRAME_COUNT = settings.TARGET_FRAME_COUNT
+COLLECTION_DURATION_SECONDS = settings.COLLECTION_DURATION_SECONDS
+MAX_FRAMES_TO_COLLECT = settings.MAX_FRAMES_TO_COLLECT
+# 상수는 중앙 설정에서 읽어옵니다. 로컬에서 편하게 쓰기 위해 별칭을 제공합니다.
+TARGET_FRAME_COUNT = settings.TARGET_FRAME_COUNT
+COLLECTION_DURATION_SECONDS = settings.COLLECTION_DURATION_SECONDS
+MAX_FRAMES_TO_COLLECT = settings.MAX_FRAMES_TO_COLLECT
 
-
-# --- 상수 정의 ---
 BASE_DIR = Path(__file__).resolve().parent
-TARGET_FRAME_COUNT = int(os.getenv("SIGN_SEQUENCE_TARGET_FRAMES", "300")) # 모델 입력 크기, 수집과 무관
-COLLECTION_DURATION_SECONDS = float(os.getenv("SIGN_SEQUENCE_COLLECTION_SECONDS", "5.0"))
-MAX_FRAMES_TO_COLLECT = 300  # 메모리 보호를 위한 안전장치
 
+# 상수들은 configs.settings에서 관리됩니다.
+# TARGET_FRAME_COUNT, COLLECTION_DURATION_SECONDS, MAX_FRAMES_TO_COLLECT
+# 의 값을 변경하려면 환경변수 또는 configs/settings.py를 수정하세요.
+
+# 기존 BASE_DIR는 파일 위치 기반으로 유지합니다.
+
+# (값은 settings 모듈에서 읽어 사용합니다.)
+
+
+# --- FastAPI 앱 초기화 ---
 app = FastAPI(title="SignSense Inference Server", version="0.2.0")
+
+# Register routers
+app.include_router(internal_router.router)
+app.include_router(diagnostics_router.router)
 
 
 # ----------------------------- Model & Inference Logic -----------------------------
@@ -172,9 +190,9 @@ async def model_status():
 @app.get("/config")
 async def get_config():
     return {
-        "target_frame_count": TARGET_FRAME_COUNT,
-        "collection_duration_seconds": COLLECTION_DURATION_SECONDS,
-        "max_frames_to_collect": MAX_FRAMES_TO_COLLECT,
+        "target_frame_count": settings.TARGET_FRAME_COUNT,
+        "collection_duration_seconds": settings.COLLECTION_DURATION_SECONDS,
+        "max_frames_to_collect": settings.MAX_FRAMES_TO_COLLECT,
     }
 
 
@@ -203,248 +221,67 @@ async def simulate_predict():
     return result
 
 
-@app.post("/simulate/create-collector")
-async def simulate_create_collector(request: Request):
-    """Test helper: create an empty SequenceCollector for given session_id.
-    Body JSON: {"session_id": str}
-    This endpoint is only intended for local testing (smoke_test).
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    session_id = payload.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required")
-
-    # Create a collector (empty) for session
-    collector = app.state.ss.new_collector(session_id)
-    return {"ok": True, "session_id": session_id, "collector_frames": len(collector.frames)}
-
-
-# ----------------------------- Internal storage endpoints -----------------------------
-
-def _check_internal_access(request: Request):
-    """Optional internal access guard.
-    If ENV INTERNAL_API_TOKEN is set, require header 'x-internal-token' to match.
-    Otherwise allow requests from localhost addresses.
-    """
-    token = os.getenv("INTERNAL_API_TOKEN")
-    if token:
-        hdr = request.headers.get("x-internal-token")
-        if hdr != token:
-            raise HTTPException(status_code=403, detail="Forbidden: invalid internal token")
-    else:
-        # If no token configured, allow only local requests as a reasonable default.
-        client = request.client
-        if client is None or client.host not in ("127.0.0.1", "::1", "localhost"):
-            # Not strictly secure in all deployments, but suitable for local/intra-host calls.
-            raise HTTPException(status_code=403, detail="Forbidden: internal endpoint only")
-
-
-@app.post("/internal/save-learning")
-async def internal_save_learning(request: Request):
-    """Internal endpoint to save collected frames for a session as 'learning' data.
-    Body JSON: { "session_id": str, "meta": { ... } }
-    This schedules an async save and returns immediately.
-    """
-    _check_internal_access(request)
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    session_id = payload.get("session_id")
-    meta = payload.get("meta", {})
-
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required")
-
-    collector = app.state.ss.collectors.get(session_id)
-    if collector is None:
-        raise HTTPException(status_code=404, detail="collector not found for session_id")
-
-    frames = collector.frames
-
-    try:
-        # schedule async save_learning
-        from storage.s3_db_saver import save_learning
-        import asyncio
-        asyncio.create_task(save_learning(frames=frames, meta={**meta, "session_id": session_id}))
-        return {"ok": True, "scheduled": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to schedule save_learning: {e}")
-
-
-@app.post("/internal/save-quiz")
-async def internal_save_quiz(request: Request):
-    """Internal endpoint to save quiz inference results. Body JSON: { "session_id": str, "inference_result": {...} }
-    The endpoint will look up frames for session_id (if available) and schedule async save_quiz.
-    """
-    _check_internal_access(request)
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    session_id = payload.get("session_id")
-    inference_result = payload.get("inference_result")
-
-    if not session_id or inference_result is None:
-        raise HTTPException(status_code=400, detail="session_id and inference_result are required")
-
-    collector = app.state.ss.collectors.get(session_id)
-    frames = collector.frames if collector is not None else []
-
-    try:
-        from storage.s3_db_saver import save_quiz
-        import asyncio
-        asyncio.create_task(save_quiz(frames=frames, inference_result=inference_result, session_id=session_id))
-        return {"ok": True, "scheduled": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to schedule save_quiz: {e}")
-
-# ----------------------------- WebSocket Signaling -----------------------------
-
+# === WebSocket Signaling & DataChannel (간단한 버전) ===
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
+    """간단한 WebSocket 시그널링 엔드포인트.
+
+    동작:
+    - 쿼리 파라미터 `token`을 받아 JWT를 검증합니다. 실패 시 연결을 닫습니다.
+    - 텍스트 메시지로 `{"type": "meta", "word_pk": .., "word_name": ..}`를 수신하면
+      app.state.ss.collectors[session_id]에 해당 메타를 저장합니다.
+    - 클라이언트가 연결을 유지하면서 DataChannel으로 프레임을 전송한다고 가정합니다.
+    """
+    # 먼저 토큰 검증
+    params = websocket.query_params
+    token = params.get("token")
+    try:
+        if not token:
+            await websocket.close(code=1008)
+            return
+        user_id = validate_token_and_get_user_id(token)
+    except Exception:
+        # 검증 실패 시 연결을 거부
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
-    peer_id = f"peer_{id(websocket)}"
-    print(f"[WS] Connected: {peer_id}")
-    pc = RTCPeerConnection()
-    app.state.ss.active_peers[peer_id] = pc
 
-    async def safe_send_json(payload: Dict[str, Any]):
-        try:
-            await websocket.send_text(json.dumps(payload))
-        except WebSocketDisconnect:
-            print(f"[WS][SEND][WARN] Peer {peer_id} disconnected before sending.")
-        except Exception as e:
-            print(f"[WS][SEND][ERR] for {peer_id}: {e}")
-
-    # --- 데이터 채널 콜백 정의 ---
-    @pc.on("datachannel")
-    def on_datachannel(channel):
-        print(f"[{session_id}] DataChannel '{channel.label}' created")
-        # collector를 직접 생성하지 않고, 래퍼 딕셔너리를 사용해 관리
-        collector_wrapper = {'collector': app.state.ss.new_collector(session_id)}
-
-        async def run_inference_once():
-            """추론을 한 번만 실행하는 헬퍼 함수"""
-            collector = collector_wrapper['collector']
-            if collector.processed:
-                return
-            collector.processed = True
-
-            print(f"[{session_id}] Flush signal received. Running inference...")
-
-            result = run_inference(app.state.ss.predictor, collector.frames)
-            result["timings"] = collector.build_timings()
-
-            await safe_send_json({
-                "type": "inference_result",
-                "data": result
-            })
-
-            # 비동기 백그라운드로 퀴즈 저장 스케줄 (외부 호출에 영향을 주지 않도록 비동기 처리)
-            try:
-                import asyncio
-                asyncio.create_task(schedule_quiz_save(frames=collector.frames, inference_result=result, session_id=session_id))
-            except Exception as e:
-                print(f"[WS][WARN] Failed to schedule quiz save: {e}")
-
-        @channel.on("message")
-        async def on_message(message):
-            if isinstance(message, str):
-                if message == "flush":
-                    await run_inference_once()
-                elif message == "reset":
-                    print(f"[{session_id}] Resetting collector for new capture.")
-                    # 새 collector로 교체
-                    collector_wrapper['collector'] = app.state.ss.new_collector(session_id)
-                return
-
-            collector = collector_wrapper['collector']
-            # 추론이 시작되기 전까지(processed=False) 프레임을 계속 수집합니다.
-            if not collector.processed:
-                # 첫 프레임 수신 시 로그를 남깁니다.
-                if collector.start_ts is None:
-                    collector.start_collection()
-                    print(f"[{session_id}] First frame received. Collecting frames...")
-                collector.add_frame(message)
+    # 세션용 collector가 없으면 새로 생성
+    collector = app.state.ss.collectors.get(session_id) or app.state.ss.new_collector(session_id)
 
     try:
         while True:
             raw = await websocket.receive_text()
-            msg = json.loads(raw)
-            action = msg.get("action")
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                # 텍스트가 JSON이 아닌 경우 무시
+                continue
 
-            if action == "offer":
-                sdp = msg.get("sdp")
-                offer = RTCSessionDescription(sdp=sdp, type=msg.get("type", "offer"))
-
-                await pc.setRemoteDescription(offer)
-                answer = await pc.createAnswer()
-                await pc.setLocalDescription(answer)
-
-                await safe_send_json({
-                    "type": "answer",
-                    "sdp": pc.localDescription.sdp,
-                })
-
-            elif action == "ice-candidate":
-                candidate_info = msg.get("candidate")
-                if candidate_info:
-                    candidate = RTCIceCandidate(
-                        sdpMid=candidate_info.get("sdpMid"),
-                        sdpMLineIndex=candidate_info.get("sdpMLineIndex"),
-                        candidate=candidate_info.get("candidate"),
-                    )
-                    await pc.addIceCandidate(candidate)
-
+            mtype = msg.get("type")
+            if mtype == "meta":
+                # 단어 메타데이터를 세션 상태에 저장
+                collector.meta = {
+                    "word_pk": msg.get("word_pk"),
+                    "word_name": msg.get("word_name"),
+                    "user_id": user_id,
+                }
+                await websocket.send_text(json.dumps({"type": "meta_ack"}))
+            elif mtype == "flush":
+                # 클라이언트가 flush 시그널을 보내면 추론 실행
+                # 실제 구현에서는 바이트 프레임 리스트를 수집하여 run_inference 호출
+                predictor = app.state.ss.predictor
+                frames = getattr(collector, "frames", [])
+                result = run_inference(predictor, frames)
+                await websocket.send_text(json.dumps({"type": "inference_result", "result": result}))
+            else:
+                # 기타 메시지: 무시 또는 에코
+                await websocket.send_text(json.dumps({"type": "noop"}))
     except WebSocketDisconnect:
-        print(f"[WS] Disconnected: {peer_id}")
-    except Exception as e:
-        print(f"[WS][FATAL] Error in WebSocket handler for {peer_id}: {e}")
-        traceback.print_exc()
-    finally:
-        if peer_id in app.state.ss.active_peers:
-            pc_to_close = app.state.ss.active_peers.pop(peer_id)
-            await pc_to_close.close()
-        if session_id in app.state.ss.collectors:
-            del app.state.ss.collectors[session_id]
-        print(f"[WS] Cleaned up resources for {peer_id} (session: {session_id})")
-
-
-# ----------------------------- Diagnostic Endpoints -----------------------------
-
-@app.post('/model/test-predict')
-async def model_test_predict():
-    """Diagnostic endpoint to verify Predictor.predict works with a random input.
-    Returns {'predicted': label, 'score': float} when predictor is available, otherwise 503.
-    """
-    predictor = app.state.ss.predictor
-    if predictor is None:
-        raise HTTPException(status_code=503, detail="Predictor not loaded")
-
-    # require numpy available
-    try:
-        import numpy as _np
-    except Exception:
-        raise HTTPException(status_code=503, detail="numpy not available on server")
-
-    # build dummy sequence matching expected feature dim
-    try:
-        feat_dim = FRAME_FEATURE_DIM if 'FRAME_FEATURE_DIM' in globals() else getattr(predictor, 'input_size', None)
-        if not feat_dim:
-            raise RuntimeError('Unknown feature dim')
-        seq_len = min(60, TARGET_FRAME_COUNT)
-        dummy = _np.random.rand(seq_len, int(feat_dim)).astype(_np.float32)
-        label, score = predictor.predict(dummy)
-        return { 'predicted': label, 'score': float(score) }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Predict failed: {e}")
+        # 연결 종료 시 리소스 정리
+        app.state.ss.collectors.pop(session_id, None)
+        return
 
 
 if __name__ == "__main__":

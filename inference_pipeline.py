@@ -14,10 +14,12 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
-# 환경 변수와 동일한 기본값을 사용합니다.
-TARGET_FRAME_COUNT = int(os.getenv("SIGN_SEQUENCE_TARGET_FRAMES", "300"))
-COLLECTION_DURATION_SECONDS = float(os.getenv("SIGN_SEQUENCE_COLLECTION_SECONDS", "5.0"))
-MAX_FRAMES_TO_COLLECT = 300
+from configs import settings
+
+# 중앙 설정에서 값을 가져옵니다.
+TARGET_FRAME_COUNT = settings.TARGET_FRAME_COUNT
+COLLECTION_DURATION_SECONDS = settings.COLLECTION_DURATION_SECONDS
+MAX_FRAMES_TO_COLLECT = settings.MAX_FRAMES_TO_COLLECT
 
 # 안전한(옵션) heavy deps import
 HEAVY_IMPORTS_AVAILABLE = True
@@ -162,4 +164,3 @@ async def schedule_quiz_save(frames: List[bytes], inference_result: Dict[str, An
 # 유틸: synchronous run_inference를 다른 쓰레드/태스크에서 호출할 때 사용하는 래퍼
 def run_inference_sync(predictor, frames):
     return run_inference(predictor, frames)
-

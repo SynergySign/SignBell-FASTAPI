@@ -29,10 +29,14 @@ class CNN_BiLSTM_Attention(nn.Module):
     """학습 스크립트와 동일한 모델 아키텍처"""
 
     def __init__(self, input_size=147, num_classes=7,
-                 cnn_channels=[64, 128, 256],
+                 cnn_channels=None,
                  lstm_hidden=128,
                  dropout=0.5):
         super().__init__()
+
+        # Avoid mutable default argument
+        if cnn_channels is None:
+            cnn_channels = [64, 128, 256]
 
         # 1D-CNN Layers
         self.conv_layers = nn.ModuleList()

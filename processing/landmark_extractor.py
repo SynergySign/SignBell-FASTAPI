@@ -55,19 +55,24 @@ HAND_LANDMARK_COUNT = 21
 
 def _decode_frame(frame_bytes: bytes):
     """Decode JPEG/PNG bytes -> RGB ndarray (uint8). Returns None on failure."""
-    # 우선 OpenCV 사용 (속도 유리)
-    arr = np.frombuffer(frame_bytes, dtype=np.uint8)
-    img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img_bgr is None:
-        return None
-    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    # Pillow fallback
-    if Image is not None and io is not None:
-        try:
+    # Try OpenCV first (fast). If it fails, fall back to Pillow.
+    try:
+        arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img_bgr is not None:
+            return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    except Exception:
+        # ignore and try Pillow fallback below
+        pass
+
+    # Pillow fallback (if available)
+    try:
+        if Image is not None and io is not None:
             with Image.open(io.BytesIO(frame_bytes)) as im:
                 return np.array(im.convert("RGB"))
-        except Exception:  # noqa: E722
-            return None
+    except Exception:
+        return None
+
     return None
 
 
