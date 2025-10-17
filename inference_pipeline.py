@@ -1,13 +1,18 @@
 """
-Inference pipeline module
-- 분리된 run_inference 함수와 SequenceCollector 구현
-- 퀴즈 결과를 비동기 백그라운드로 저장하는 스케줄러 제공
+모듈: inference_pipeline.py
+설명:
+- 프레임 시퀀스 수집과 랜드마크 추출/모델 추론을 수행하는 공통 파이프라인 구현을 제공합니다.
+- 주요 구성 요소:
+  - run_inference(predictor, frames): 랜드마크 추출 및 Predictor를 이용한 추론 수행
+  - SequenceCollector: 실시간 스트림에서 프레임을 수집하고 타이밍을 관리하는 유틸
+  - schedule_quiz_save: 추론 결과를 비동기적으로 저장하도록 스케줄
 
-이 모듈은 heavy deps(mediapipe, torch 등)가 없을 경우에도 안전하게 동작하도록 예외 처리를 포함합니다.
+since: 2025.10.17
+author: 백승현
 """
+
 from __future__ import annotations
 
-import os
 import time
 import traceback
 import asyncio
@@ -93,6 +98,21 @@ def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]
 
 @dataclass
 class SequenceCollector:
+    """세션별 프레임 수집기.
+
+    역할/정의:
+    - WebSocket/DataChannel 등에서 들어오는 바이트 프레임을 임시 보관하고,
+      수집 시작/종료 타이밍, 수집 완료 판단(is_full) 등을 제공합니다.
+
+    주요 메서드:
+    - start_collection(): 수집 시작 타이머 설정
+    - add_frame(data): 프레임 추가(조건에 따라 무시)
+    - is_full(): 시간/프레임 수 기준으로 수집 완료 여부 판단
+    - build_timings(): 수집 타이밍 정보 반환
+
+    since: 2025.10.17
+    author: 백승현
+    """
     frames: List[bytes] = field(default_factory=list)
     start_ts: Optional[float] = None
     processed: bool = False

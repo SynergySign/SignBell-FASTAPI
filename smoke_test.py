@@ -1,12 +1,16 @@
-"""간단한 REST 스모크 테스트 스크립트.
-
-실행 전:
-  1) uvicorn main:app --reload (다른 터미널에서 서버 실행)
-  2) python smoke_test.py
-
-aiortc 설치 여부와 무관하게 동작 가능한 기본 REST 엔드포인트만 검증.
 """
-from __future__ import annotations
+모듈: smoke_test.py
+설명:
+- 기본 REST 엔드포인트에 대한 간단한 스모크 테스트 스크립트입니다.
+- 실행 전 서버(uvicorn)를 띄운 뒤 이 스크립트를 실행하여 주요 엔드포인트가 동작하는지 확인합니다.
+
+사용법:
+  1) uvicorn main:app --reload 로 서버 실행
+  2) python smoke_test.py 로 스모크 테스트 실행
+
+since: 2025.10.17
+author: 백승현
+"""
 
 import json
 import os

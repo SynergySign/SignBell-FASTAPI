@@ -1,3 +1,17 @@
+"""
+모듈: security/jwt_validator.py
+설명:
+- JWT 디코딩/검증 유틸리티를 제공합니다. FastAPI Depends 및 WebSocket 검증 흐름에서 사용됩니다.
+- 제공 함수:
+  - get_current_user_id(token: str = Depends(oauth2_scheme)) : REST 엔드포인트용 의존성, 토큰에서 user id 반환
+  - validate_token_and_get_user_id(token: str) : WebSocket 핸드셰이크 등에서 토큰을 검증하고 user id 반환
+
+주의: `python-jose`가 설치되어 있지 않으면 데코딩 시 예외를 발생시키는 더미 구현이 사용됩니다.
+
+since: 2025.10.17
+author: 백승현
+"""
+
 from typing import Any
 
 from fastapi import Depends, HTTPException, status

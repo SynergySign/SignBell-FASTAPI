@@ -1,3 +1,17 @@
+"""
+모듈: processing/predictor.py
+설명:
+- 학습 스크립트와 동일한 모델 아키텍처(CNN + BiLSTM + Attention)를 정의하고,
+  체크포인트로부터 모델을 로드하여 추론을 수행하는 `Predictor` 클래스를 제공합니다.
+- 주요 구성 요소:
+  - PositionalEncoding: 모델의 위치 인코딩 유틸
+  - CNN_BiLSTM_Attention: 모델 아키텍처
+  - Predictor: 모델 로드 및 predict() 인터페이스
+
+since: 2025.10.17
+author: 백승현
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -8,7 +22,11 @@ import math
 # 학습 스크립트(cnn_bilstm_attention_classifier.py)와 동일한 모델 구조로 교체합니다.
 
 class PositionalEncoding(nn.Module):
-    """Sinusoidal Positional Encoding (batch_first)"""
+    """Sinusoidal positional encoding (batch_first).
+
+    since: 2025.10.17
+    author: 백승현
+    """
     def __init__(self, d_model, max_len=500):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
@@ -26,7 +44,15 @@ class PositionalEncoding(nn.Module):
 
 
 class CNN_BiLSTM_Attention(nn.Module):
-    """학습 스크립트와 동일한 모델 아키텍처"""
+    """학습 스크립트와 동일한 모델 아키텍처.
+
+    역할/정의:
+    - 1D-CNN으로 시퀀스의 특징을 추출하고, BiLSTM 및 Multi-Head Attention을 통해
+      시퀀스 정보를 통합하여 분류 결과를 출력합니다.
+
+    since: 2025.10.17
+    author: 백승현
+    """
 
     def __init__(self, input_size=147, num_classes=7,
                  cnn_channels=None,
@@ -123,6 +149,15 @@ class CNN_BiLSTM_Attention(nn.Module):
 
 # --- Predictor 모듈 ---
 class Predictor:
+    """체크포인트에서 모델을 로드하고 추론을 제공하는 래퍼 클래스.
+
+    역할/정의:
+    - 모델 파일에서 클래스 개수 및 레이블 정보를 복원하고 모델 파라미터를 로드합니다.
+    - `predict(landmark_sequence)` 메서드로 (레이블, 신뢰도) 튜플을 반환합니다.
+
+    since: 2025.10.17
+    author: 백승현
+    """
     def __init__(self, model_path, sequence_length=300, input_size=147):
         """
         모델을 로드하고 추론을 준비합니다.

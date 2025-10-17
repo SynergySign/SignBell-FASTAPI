@@ -1,17 +1,33 @@
 """
-SignSense Test Server
-- FastAPI 기반 WebSocket 시그널링 + WebRTC DataChannel 프레임 수신 프로토타입
-- 모델 로딩 및 프레임 시퀀스 수집 후 추론 결과 반환
+모듈: main.py
+설명:
+- SignSense Inference Server의 FastAPI 진입점입니다.
+- WebSocket 시그널링 엔드포인트와 간단한 REST 엔드포인트들을 제공하며,
+  모델 로드와 전역 상태(AppState) 관리를 담당합니다.
+- 주요 엔드포인트:
+  - GET  /                 : 서버 상태 확인
+  - GET  /health           : 예측기(모델) 로드 상태 확인
+  - GET  /model/status     : 모델 로드 상태 및 경로 정보 반환
+  - GET  /config           : 서버 구성값 반환
+  - GET  /client           : 테스트용 HTML 클라이언트 제공
+  - POST /simulate/predict: 스모크 테스트용 더미 추론 엔드포인트
+  - WS   /ws/{session_id}  : WebSocket 시그널링 엔드포인트 (token 쿼리 파라미터로 JWT 검증)
+
+since: 2025.10.17
+author: 백승현
 """
+
 from __future__ import annotations
 
 import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from security.jwt_validator import validate_token_and_get_user_id
 
@@ -19,7 +35,7 @@ from configs import settings
 from routers import internal as internal_router
 from routers import diagnostics as diagnostics_router
 
-# --- Core Dependencies ---
+# --- 중요 의존성 ---
 # 일부 라이브러리는 개발환경에 설치되어 있지 않을 수 있으므로 안전하게 임포트합니다.
 HEAVY_IMPORTS_AVAILABLE = True
 try:
@@ -59,42 +75,72 @@ except Exception as _e:
 TARGET_FRAME_COUNT = settings.TARGET_FRAME_COUNT
 COLLECTION_DURATION_SECONDS = settings.COLLECTION_DURATION_SECONDS
 MAX_FRAMES_TO_COLLECT = settings.MAX_FRAMES_TO_COLLECT
-# 상수는 중앙 설정에서 읽어옵니다. 로컬에서 편하게 쓰기 위해 별칭을 제공합니다.
-TARGET_FRAME_COUNT = settings.TARGET_FRAME_COUNT
-COLLECTION_DURATION_SECONDS = settings.COLLECTION_DURATION_SECONDS
-MAX_FRAMES_TO_COLLECT = settings.MAX_FRAMES_TO_COLLECT
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# 상수들은 configs.settings에서 관리됩니다.
-# TARGET_FRAME_COUNT, COLLECTION_DURATION_SECONDS, MAX_FRAMES_TO_COLLECT
-# 의 값을 변경하려면 환경변수 또는 configs/settings.py를 수정하세요.
-
-# 기존 BASE_DIR는 파일 위치 기반으로 유지합니다.
-
-# (값은 settings 모듈에서 읽어 사용합니다.)
-
-
 # --- FastAPI 앱 초기화 ---
-app = FastAPI(title="SignSense Inference Server", version="0.2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """앱 수명주기: 시작 시 Predictor 로드 시도 (기존 on_event('startup') 대체)."""
+    print("[STARTUP] Attempting to load Predictor...")
+    # 이미 로드되어 있으면 재사용
+    if getattr(app.state, 'ss', None) and getattr(app.state.ss, 'predictor', None):
+        print("[STARTUP] Predictor already initialized.")
+        yield
+        return
 
-# Register routers
+    try:
+        # 동적으로 Import 시도하여 실제 운영환경의 종속성을 사용할 수 있게 함
+        from processing.predictor import get_predictor as _get_predictor
+        predictor_instance = _get_predictor()
+        # app.state.ss 가 없을 수 있으므로 안전하게 설정
+        if not getattr(app.state, 'ss', None):
+            app.state.ss = AppState()
+        app.state.ss.predictor = predictor_instance
+        print("[STARTUP] Predictor successfully loaded.")
+    except Exception as e:
+        # 자세한 예외 정보 로그
+        print(f"[STARTUP][ERROR] Failed to load Predictor dynamically: {e}")
+        traceback.print_exc()
+        if not getattr(app.state, 'ss', None):
+            app.state.ss = AppState()
+        app.state.ss.predictor = None
+        print("[STARTUP] Running without Predictor. Install required packages and restart the server for real inference.")
+
+    yield
+    # (선택) 종료 시 정리 로직을 여기에 추가할 수 있습니다.
+
+
+app = FastAPI(title="SignSense Inference Server", version="0.2.0", lifespan=lifespan)
+
+# 명시적으로 app.state를 초기화하여 정적 분석기의 'state' 관련 경고를 줄입니다.
+app.state = SimpleNamespace()
+
+# 라우터 등록
 app.include_router(internal_router.router)
 app.include_router(diagnostics_router.router)
 
 
-# ----------------------------- Model & Inference Logic -----------------------------
+# ----------------------------- 모델 및 추론 로직 -----------------------------
 
-# Use the shared inference pipeline implementation (separated module)
-from inference_pipeline import run_inference, SequenceCollector, schedule_quiz_save
+# 공통 추론 파이프라인 사용
+from inference_pipeline import run_inference, SequenceCollector
 
 
-# ----------------------------- Global State -----------------------------
+# ----------------------------- 전역 상태 -----------------------------
 
 class AppState:
+    """애플리케이션 전역 상태를 보관하는 컨테이너.
+
+    역할/정의:
+    - Predictor 인스턴스, 활성 피어 연결, 세션별 SequenceCollector를 관리합니다.
+
+    since: 2025.10.17
+    author: 백승현
+    """
     def __init__(self):
         # Predictor는 heavy deps가 없으면 None이 됩니다.
-        # --- 모델 로드 오류 해결 ---
+        # ---모델 로드 오류 해결---
         # torch.load가 unpickle 시 특정 모듈명 아래에서 클래스를 찾는 경우가 있어,
         # 필요한 클래스들을 가능한 모듈 이름에 미리 주입한 뒤 모델을 로드합니다.
         import types
@@ -135,35 +181,12 @@ class AppState:
 app.state.ss = AppState()
 
 
-# ----------------------------- Startup Event -----------------------------
+# ----------------------------- 스타트업 이벤트 -----------------------------
 
-@app.on_event("startup")
-async def startup_event():
-    """서버 시작 시 실제 추론 모델(Predictor)을 로드하려 시도합니다.
-    운영환경에서 aiortc/mediapipe/torch 등이 설치되어 있다면 `processing.predictor.get_predictor()`를 호출해
-    Predictor 인스턴스를 초기화합니다. 실패하면 에러를 로깅하고 predictor는 None으로 남겨둡니다.
-    """
-    print("[STARTUP] Attempting to load Predictor...")
-    # 이미 로드되어 있으면 재사용
-    if getattr(app.state.ss, 'predictor', None):
-        print("[STARTUP] Predictor already initialized.")
-        return
-
-    try:
-        # 동적으로 Import 시도하여 실제 운영환경의 종속성을 사용할 수 있게 함
-        from processing.predictor import get_predictor as _get_predictor
-        predictor_instance = _get_predictor()
-        app.state.ss.predictor = predictor_instance
-        print("[STARTUP] Predictor successfully loaded.")
-    except Exception as e:
-        # 자세한 예외 정보 로그
-        print(f"[STARTUP][ERROR] Failed to load Predictor dynamically: {e}")
-        traceback.print_exc()
-        app.state.ss.predictor = None
-        print("[STARTUP] Running without Predictor. Install required packages and restart the server for real inference.")
+# @app.on_event("startup") 블록은 lifespan으로 대체되어 제거되었습니다.
 
 
-# ----------------------------- REST Endpoints -----------------------------
+# ----------------------------- REST 엔드포인트 -----------------------------
 
 @app.get("/")
 async def root():
@@ -221,7 +244,7 @@ async def simulate_predict():
     return result
 
 
-# === WebSocket Signaling & DataChannel (간단한 버전) ===
+# === WebSocket 시그널링 엔드포인트 ===
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """간단한 WebSocket 시그널링 엔드포인트.

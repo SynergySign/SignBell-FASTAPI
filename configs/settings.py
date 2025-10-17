@@ -1,3 +1,18 @@
+"""
+모듈: configs/settings.py
+설명:
+- 애플리케이션 설정을 로드하고 캐시된 Settings 인스턴스를 제공하는 경량 설정 모듈입니다.
+- pydantic에 의존하지 않도록 구현되어 있어, pydantic 미설치 환경에서도 프로젝트가 실행될 수 있습니다.
+
+주요 항목:
+- JWT 관련 설정
+- 추론/수집 관련 튜닝 파라미터 (TARGET_FRAME_COUNT 등)
+- SSL 경로 설정
+
+since: 2025.10.17
+author: 백승현
+"""
+
 # Lightweight settings implementation that does not depend on pydantic.
 # This keeps the project runnable even when pydantic v2/pydantic-settings are not installed.
 from functools import lru_cache
@@ -22,9 +37,9 @@ class Settings:
 
 @lru_cache()
 def get_settings() -> Settings:
-    """Return a cached Settings instance.
+    """캐시된 Settings 인스턴스를 반환합니다.
 
-    Usage:
+    사용 예:
         from configs.settings import get_settings
         settings = get_settings()
         secret = settings.JWT_SECRET_KEY
@@ -32,8 +47,7 @@ def get_settings() -> Settings:
     return Settings()
 
 
-# Module-level convenience aliases for backward compatibility with code that imported
-# `from configs import settings; settings.TARGET_FRAME_COUNT`.
+# Module-level 편의 별칭(기존 코드 호환성 유지)
 _settings = get_settings()
 JWT_SECRET_KEY = _settings.JWT_SECRET_KEY
 JWT_ALGORITHM = _settings.JWT_ALGORITHM
@@ -43,5 +57,5 @@ MAX_FRAMES_TO_COLLECT = _settings.MAX_FRAMES_TO_COLLECT
 SSL_CERT_PATH = _settings.SSL_CERT_PATH
 SSL_KEY_PATH = _settings.SSL_KEY_PATH
 
-# Expose function
+# get_settings 함수 노출
 get_settings = get_settings
