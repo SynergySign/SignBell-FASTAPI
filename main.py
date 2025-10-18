@@ -27,7 +27,7 @@ from typing import Optional, Dict
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse
 from security.jwt_validator import validate_token_and_get_user_id
 
@@ -256,16 +256,19 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     - 클라이언트가 연결을 유지하면서 DataChannel으로 프레임을 전송한다고 가정합니다.
     """
     # 먼저 토큰 검증
-    params = websocket.query_params
-    token = params.get("token")
+    # WS 쿠키 기반 인증: 쿼리 파라미터 방식은 더 이상 사용하지 않습니다.
     try:
+        token = websocket.cookies.get(settings.COOKIE_ACCESS_TOKEN_NAME)
         if not token:
-            await websocket.close(code=1008)
+            # 인증 토큰이 없는 경우 연결 거부 (401을 Close 코드로 사용)
+            await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
             return
+
+        # 토큰 검증 (검증 실패 시 HTTPException이 발생합니다)
         user_id = validate_token_and_get_user_id(token)
     except Exception:
-        # 검증 실패 시 연결을 거부
-        await websocket.close(code=1008)
+        # 검증 실패 또는 내부 오류 시 연결 거부
+        await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
         return
 
     await websocket.accept()
