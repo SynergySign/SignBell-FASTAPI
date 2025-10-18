@@ -12,9 +12,9 @@ since: 2025.10.17
 author: 백승현
 """
 
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 
 # Try to import python-jose; if unavailable provide a dummy implementation that raises
@@ -56,14 +56,55 @@ def _decode_jwt(token: str) -> dict[str, Any]:
         ) from exc
 
 
-def get_current_user_id(token: str = Depends(oauth2_scheme)) -> Any:
-    """FastAPI dependency to obtain current user id from a Bearer token.
+def _extract_token_from_request(request: Request) -> Optional[str]:
+    """Extract JWT from request using the strategy: Authorization: Bearer <token> -> cookie.
 
-    This is convenient for REST endpoints that use Depends(get_current_user_id).
-    It returns the value of `sub` or `user_id` claim (as-is).
+    This mirrors the Spring `resolveToken` behaviour: prefer the Authorization header, fall back to
+    an HTTP-only cookie named by `settings.COOKIE_ACCESS_TOKEN_NAME`.
+
+    Returns the token string or None if not found.
     """
+    # 1) Authorization header (Bearer)
+    auth_header = request.headers.get("Authorization") or request.headers.get("authorization")
+    if auth_header:
+        parts = auth_header.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1]
+
+    # 2) Cookie fallback
+    try:
+        cookie_name = getattr(settings, "COOKIE_ACCESS_TOKEN_NAME", "ACCESS_TOKEN")
+        token = request.cookies.get(cookie_name)
+        if token:
+            return token
+    except Exception:
+        # Defensive: request.cookies may not behave as dict-like in some test doubles
+        pass
+
+    return None
+
+
+def _extract_user_id_from_payload(payload: dict[str, Any]) -> Any:
+    """Normalize user id extraction from JWT payload (sub or user_id)."""
+    return payload.get("sub") or payload.get("user_id")
+
+
+def get_current_user_id(request: Request) -> Any:
+    """FastAPI dependency to obtain current user id from the incoming Request.
+
+    This supports tokens provided in either the Authorization Bearer header or an HTTP cookie
+    (see `_extract_token_from_request`). Use as `Depends(get_current_user_id)` in REST endpoints.
+    """
+    token = _extract_token_from_request(request)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication token (expected Authorization header or cookie)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     payload = _decode_jwt(token)
-    user_id = payload.get("sub") or payload.get("user_id")
+    user_id = _extract_user_id_from_payload(payload)
     if user_id is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -76,6 +117,15 @@ def get_current_user_id(token: str = Depends(oauth2_scheme)) -> Any:
 def validate_token_and_get_user_id(token: str) -> Any:
     """Utility for WebSocket handlers: validate raw token (query param) and return user id.
 
+    This decodes the provided token directly (WebSocket handshakes may only send a query param).
     Caller (e.g., WebSocket handshake) should catch HTTPException and close the connection if needed.
     """
-    return get_current_user_id(token)
+    payload = _decode_jwt(token)
+    user_id = _extract_user_id_from_payload(payload)
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token missing required user identifier",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user_id

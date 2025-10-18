@@ -34,6 +34,12 @@ class Settings:
         self.SSL_CERT_PATH: str = os.getenv("SSL_CERT_PATH", "certs/cert.pem")
         self.SSL_KEY_PATH: str = os.getenv("SSL_KEY_PATH", "certs/key.pem")
 
+        # Cookie settings (used for cookie-based token extraction)
+        # Default name kept as ACCESS_TOKEN to match Spring's suggested CookieProperties
+        self.COOKIE_ACCESS_TOKEN_NAME: str = os.getenv("COOKIE_ACCESS_TOKEN_NAME", "ACCESS_TOKEN")
+        # Optional max age for the access token cookie (seconds). Not used by validator but available to other modules.
+        self.COOKIE_ACCESS_TOKEN_MAX_AGE: int = int(os.getenv("COOKIE_ACCESS_TOKEN_MAX_AGE", "3600"))
+
 
 @lru_cache()
 def get_settings() -> Settings:
@@ -56,6 +62,10 @@ COLLECTION_DURATION_SECONDS = _settings.COLLECTION_DURATION_SECONDS
 MAX_FRAMES_TO_COLLECT = _settings.MAX_FRAMES_TO_COLLECT
 SSL_CERT_PATH = _settings.SSL_CERT_PATH
 SSL_KEY_PATH = _settings.SSL_KEY_PATH
+
+# Cookie aliases
+COOKIE_ACCESS_TOKEN_NAME = _settings.COOKIE_ACCESS_TOKEN_NAME
+COOKIE_ACCESS_TOKEN_MAX_AGE = _settings.COOKIE_ACCESS_TOKEN_MAX_AGE
 
 # get_settings 함수 노출
 get_settings = get_settings
