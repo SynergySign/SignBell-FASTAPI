@@ -46,6 +46,7 @@ def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]
     """
     수집된 프레임에 대해 랜드마크 추출 및 모델 추론을 수행합니다.
     (원래 main.py에 있던 내용을 여기로 옮겼습니다.)
+    변경: 이제 TARGET_FRAME_COUNT로 강제 패딩/절단하지 않습니다. 클라이언트에서 넘어온 프레임 시퀀스 그대로 추출하여 모델에 전달합니다.
     """
     start = time.time()
     landmarks_info: Dict[str, Any] = {}
@@ -57,7 +58,8 @@ def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]
         if extract_sequence_from_frames is None:
             raise RuntimeError("Landmark extractor not available (missing heavy dependencies)")
 
-        landmark_sequence = extract_sequence_from_frames(frames, target_len=TARGET_FRAME_COUNT, skip_missing=False)
+        # NOTE: target_len=None 으로 호출하여 클라이언트에서 넘어온 길이를 유지합니다.
+        landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
 
         # 2. 추출된 데이터 유효성 검사
         if landmark_sequence is None or (hasattr(landmark_sequence, '__len__') and len(landmark_sequence) == 0):
@@ -75,7 +77,11 @@ def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]
             if predictor is None:
                 raise RuntimeError("Predictor not available (missing heavy dependencies)")
             landmark_sequence_float32 = landmark_sequence.astype(np.float32) if np is not None else landmark_sequence
-            predicted_label, score = predictor.predict(landmark_sequence_float32)
+            # Static-analysis-safe local guard: ensure predictor is not None before calling
+            p = predictor
+            if p is None:
+                raise RuntimeError("Predictor not available (missing heavy dependencies)")
+            predicted_label, score = p.predict(landmark_sequence_float32)
 
     except Exception as e:
         print(f"[ERROR][inference_pipeline] Exception during inference: {e}")
@@ -134,7 +140,10 @@ class SequenceCollector:
                 self.frames.append(data)
 
     def is_full(self) -> bool:
-        """시간 조건 또는 프레임 수 조건으로 수집이 완료되었는지 판단합니다."""
+        """시간 조건 또는 프레임 수 조건으로 수집이 완료되었는지 판단합니다.
+
+        변경: TARGET_FRAME_COUNT 기준 검사 제거 — 이제 수집 완료 여부는 시간 경과 또는 MAX_FRAMES_TO_COLLECT만으로 결정됩니다.
+        """
         if self.start_ts is None:
             return False
 
@@ -142,9 +151,7 @@ class SequenceCollector:
         if time_elapsed >= COLLECTION_DURATION_SECONDS:
             return True
 
-        if len(self.frames) >= TARGET_FRAME_COUNT:
-            return True
-
+        # TARGET_FRAME_COUNT 검사 제거: 클라이언트에서 오는대로 수집하고, 필요 시 MAX_FRAMES_TO_COLLECT에서 중단
         if len(self.frames) >= MAX_FRAMES_TO_COLLECT:
             return True
 

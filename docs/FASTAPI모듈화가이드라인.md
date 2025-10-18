@@ -15,6 +15,8 @@
 | `JWT_ALGORITHM` | ENV (기본값: HS256) | JWT 인코딩/디코딩 알고리즘. |
 | `TARGET_FRAME_COUNT` | ENV | `inference_pipeline.py`와 `main.py`의 상수를 대체합니다. |
 | `COLLECTION_DURATION_SECONDS` | ENV | `inference_pipeline.py`와 `main.py`의 상수를 대체합니다. |
++| `COOKIE_ACCESS_TOKEN_NAME` | ENV (기본값: ACCESS_TOKEN) | REST 요청에서 쿠키 기반 토큰을 찾을 때 사용하는 쿠키 이름. |
++| `COOKIE_ACCESS_TOKEN_MAX_AGE` | ENV (기본값: 3600) | 액세스 토큰 쿠키의 권장 만료(초). |
 
 #### 1.2. `security/jwt_validator.py` (신규 파일)
 
@@ -23,8 +25,8 @@
 | 구현 내용 | 설명 |
 | :--- | :--- |
 | **의존성** | `configs.settings`, `python-jose` 라이브러리. |
-| **핵심 함수** | `def get_current_user_id(token: str = Depends(oauth2_scheme))` | 쿼리 파라미터로 받은 토큰을 디코딩하고 유효성을 검증합니다. 유효하면 사용자 ID(또는 세션에 필요한 클레임)를 반환하고, 실패 시 `HTTPException(401)`을 발생시켜 연결을 거부합니다. |
-| **WebSocket 사용** | `main.py`의 `/ws/{session_id}` 핸들러에서 쿼리 파라미터로 받은 토큰에 대해 이 검증 함수를 실행합니다. |
+| **핵심 함수** | `def get_current_user_id(request: Request) -> Any` | REST 엔드포인트용 FastAPI 의존성으로, Authorization 헤더의 Bearer 토큰을 우선 확인하고(Authorization: Bearer <token>), 없으면 HTTP 쿠키(`COOKIE_ACCESS_TOKEN_NAME`)에서 토큰을 찾아 디코딩/검증합니다. 유효하면 사용자 ID(또는 세션에 필요한 클레임)를 반환하고, 실패 시 `HTTPException(401)`을 발생시켜 접근을 거부합니다. |
+| **WebSocket 사용** | WebSocket 핸드셰이크 흐름은 쿼리파라미터 `token`을 사용합니다. `/ws/{session_id}` 핸들러는 쿼리 토큰을 받아 `validate_token_and_get_user_id(token)`으로 검증합니다(쿼리 토큰은 `jwt_validator`의 WS 유틸을 재사용). |
 
 ---
 

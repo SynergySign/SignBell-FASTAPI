@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
+import os
 
 # Try to import python-jose; if unavailable provide a dummy implementation that raises
 try:
@@ -102,6 +103,12 @@ def get_current_user_id(request: Request) -> Any:
             detail="Missing authentication token (expected Authorization header or cookie)",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Fallback: allow a simple internal API token (opaque) defined via env INTERNAL_API_TOKEN
+    internal_token = os.getenv("INTERNAL_API_TOKEN")
+    if internal_token and token == internal_token:
+        # Return a sentinel user id for internal calls
+        return "internal_service"
 
     payload = _decode_jwt(token)
     user_id = _extract_user_id_from_payload(payload)

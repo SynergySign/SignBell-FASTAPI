@@ -6,7 +6,7 @@
 
 **문서 버전:** v1.0
 
-**최종 수정일:** 2025.10.12
+**최종 수정일:** 2025.10.18
 
 
 FastAPI + WebSocket(WebRTC 시그널링) + aiortc(DataChannel) 기반 수어 인식 서버입니다.
@@ -21,8 +21,8 @@ FastAPI + WebSocket(WebRTC 시그널링) + aiortc(DataChannel) 기반 수어 인
 - 의존성: `requirements.txt`
 
 주요 동작/구성
-- 기본 수집 프레임 길이(TARGET_FRAME_COUNT): 300 (환경변수 `SIGN_SEQUENCE_TARGET_FRAMES`로 오버라이드 가능)
-- 수집 기준 시간: 환경변수 `SIGN_SEQUENCE_COLLECTION_SECONDS` (기본 5.0 초)
+- 기본 수집 프레임 길이(TARGET_FRAME_COUNT): 설정 파일(`configs/settings.py`)의 `TARGET_FRAME_COUNT`로 제어
+- 수집 기준 시간: 설정 파일의 `COLLECTION_DURATION_SECONDS`로 제어
 - DataChannel label: `frames` (브라우저 ↔ 서버가 프레임을 주고받는 채널)
 
 목표 독자
@@ -114,10 +114,14 @@ uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs/key.pem --ssl-ce
 주: macOS에서 브라우저가 카메라 권한을 HTTPS로만 허용하는 경우가 많으므로 로컬 테스트 시 인증서 준비를 권장합니다(`mkcert` 사용 가능).
 
 환경변수 요약
-- SIGN_SEQUENCE_TARGET_FRAMES (int): 모델 입력 시퀀스 길이. 기본 300
-- SIGN_SEQUENCE_COLLECTION_SECONDS (float): 수집 지속시간(초). 기본 5.0
+- TARGET_FRAME_COUNT (int): 모델 입력 시퀀스 길이. 기본 값은 `configs/settings.py`에서 지정
+- COLLECTION_DURATION_SECONDS (float): 수집 지속시간(초). 기본 값은 `configs/settings.py`에서 지정
 - SIGN_EXTRACT_LANDMARKS (0/1): 서버 측에서 프레임→랜드마크 추출 수행 여부
 - INTERNAL_API_TOKEN: 내부 엔드포인트 보호용 토큰(운영 시 권장)
+- JWT_SECRET_KEY: JWT 디코딩에 사용되는 비밀 키 (ENV)
+- JWT_ALGORITHM: JWT 알고리즘 (기본: HS256)
+- COOKIE_ACCESS_TOKEN_NAME: REST 요청에서 액세스 토큰을 찾을 때 사용하는 쿠키 이름 (기본: ACCESS_TOKEN)
+- COOKIE_ACCESS_TOKEN_MAX_AGE: 액세스 토큰 쿠키의 권장 만료(초, 기본: 3600)
 
 ---
 
@@ -132,8 +136,8 @@ uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs/key.pem --ssl-ce
 - GET  /client           : `client_test.html` 반환 (테스트용)
 - WS   /ws/{session}     : WebSocket 시그널링(Offer/Answer)
 - POST /simulate/predict: 더미 프레임으로 동작하는 REST 추론 시뮬레이터
-- POST /internal/save-learning: 내부(개발용) 학습 데이터 저장 스케줄 엔드포인트
-- POST /internal/save-quiz    : 내부(개발용) 퀴즈 결과 저장 스케줄 엔드포인트
+- POST /api/internal/save-learning: 내부(개발용) 학습 데이터 저장 스케줄 엔드포인트
+- POST /api/internal/save-quiz    : 내부(개발용) 퀴즈 결과 저장 스케줄 엔드포인트
 
 ---
 
@@ -144,7 +148,7 @@ uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs/key.pem --ssl-ce
 - `main.py`:
   - FastAPI 앱 엔트리포인트입니다. WebSocket 시그널링(offer/answer) 및 DataChannel을 통해 들어오는 프레임을 수집합니다.
   - `SequenceCollector`와 `run_inference` 호출 지점이 있으며, 추론 완료 시 WebSocket으로 결과를 전송합니다.
-  - 내부 저장 호출(`/internal/save-learning`, `/internal/save-quiz`)을 백그라운드 작업으로 스케줄합니다.
+  - 내부 저장 호출(`/api/internal/save-learning`, `/api/internal/save-quiz`)을 백그라운드 작업으로 스케줄합니다.
 
 - `processing/landmark_extractor.py`:
   - MediaPipe Holistic 기반의 랜드마크 추출기입니다. 프레임(이미지) 시퀀스를 받아 프레임 당 147차원 특징 벡터로 변환합니다.
@@ -168,7 +172,7 @@ uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs/key.pem --ssl-ce
   - 브라우저에서 카메라를 캡쳐하고 JPEG를 DataChannel로 전송하는 테스트 페이지입니다.
 
 - `smoke_test.py`:
-  - REST 엔드포인트(비-RTC 부분)를 검증하는 간단한 스모크 테스트 스크립트입니다.
+  - REST 엔드포인트(비-RTC 부분)를 검증하는 간단한 스모크 테스트 스크립트입니다. 내부 엔드포인트 호출 시 `INTERNAL_API_TOKEN` 환경변수를 이용해 Authorization: Bearer 를 전송합니다.
 
 ---
 
@@ -278,12 +282,12 @@ function flush() {
 - 내부 엔드포인트는 `INTERNAL_API_TOKEN`으로 보호하세요.
 - HTTPS 및 네트워크 레벨 접근 제어(방화벽)를 구성하세요.
 
-간단한 Java(RestTemplate) 예제 - `/internal/save-learning` 호출
+간단한 Java(RestTemplate) 예제 - `/api/internal/save-learning` 호출
 
 ```java
 // RestTemplate 예제
 RestTemplate rest = new RestTemplate();
-String url = "https://fastapi-host:8443/internal/save-learning";
+String url = "https://fastapi-host:8443/api/internal/save-learning";
 HttpHeaders headers = new HttpHeaders();
 headers.setContentType(MediaType.APPLICATION_JSON);
 headers.setBearerAuth(System.getenv("INTERNAL_API_TOKEN"));

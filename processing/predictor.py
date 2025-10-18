@@ -18,6 +18,10 @@ import numpy as np
 from pathlib import Path
 import math
 
+# Import centralized settings to align max sequence length with runtime config
+from configs import settings
+from typing import Optional
+
 # --- 모델 클래스 정의 ---
 # 학습 스크립트(cnn_bilstm_attention_classifier.py)와 동일한 모델 구조로 교체합니다.
 
@@ -158,13 +162,15 @@ class Predictor:
     since: 2025.10.17
     author: 백승현
     """
-    def __init__(self, model_path, sequence_length=300, input_size=147):
+    def __init__(self, model_path, sequence_length: Optional[int] = None, input_size=147):
         """
         모델을 로드하고 추론을 준비합니다.
+        sequence_length가 제공되지 않으면 configs.settings.MAX_FRAMES_TO_COLLECT를 사용합니다.
         """
         # 새로 추가: 모델 경로 및 메타 정보 저장
         self.model_path = str(model_path)
-        self.sequence_length = sequence_length
+        # Use provided sequence_length or fallback to settings.MAX_FRAMES_TO_COLLECT
+        self.sequence_length = sequence_length if sequence_length is not None else settings.MAX_FRAMES_TO_COLLECT
         self.input_size = input_size
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -229,7 +235,8 @@ class Predictor:
         
         # 입력 데이터 크기 조절 (패딩/자르기)
         num_frames = landmarks_np.shape[0]
-        max_frames = 300 # 학습 시 사용한 max_frames와 동일해야 함
+        # Use sequence_length set from settings to determine padding/truncation
+        max_frames = int(self.sequence_length)
         if num_frames < max_frames:
             pad_size = max_frames - num_frames
             # 패딩 배열의 데이터 타입도 float32로 명시하여 타입 불일치 문제를 방지합니다.
@@ -264,11 +271,9 @@ def get_predictor():
     if not model_path.exists():
         raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
 
-    # Predictor 생성 시 num_classes 인자를 제거합니다.
-    # 클래스 개수는 체크포인트에서 직접 읽어오기 때문입니다.
+    # Predictor 생성: sequence_length는 설정에서 자동으로 결정됩니다.
     predictor = Predictor(
         model_path=str(model_path),
-        sequence_length=300,
         input_size=147
     )
     return predictor
