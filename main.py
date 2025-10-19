@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+import asyncio
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse
@@ -117,8 +118,12 @@ app = FastAPI(title="SignSense Inference Server", version="0.2.0", lifespan=life
 app.state = SimpleNamespace()
 
 # 라우터 등록
-app.include_router(internal_router.router)
+# internal router is deprecated in favor of WebSocket-based flow; keep commented to avoid exposing REST save endpoints
+# app.include_router(internal_router.router)
 app.include_router(diagnostics_router.router)
+
+# Import storage scheduling helpers from inference pipeline
+from inference_pipeline import schedule_quiz_save, schedule_learning_save
 
 
 # ----------------------------- 모델 및 추론 로직 -----------------------------
@@ -287,19 +292,40 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             mtype = msg.get("type")
             if mtype == "meta":
-                # 단어 메타데이터를 세션 상태에 저장
+                # 단어 메타데이터를 세션 상태에 저장만 합니다 (저장 스케줄링은 제거)
                 collector.meta = {
                     "word_pk": msg.get("word_pk"),
                     "word_name": msg.get("word_name"),
                     "user_id": user_id,
                 }
+
+                # 클라이언트로 메타 수신 확인 응답만 보냅니다.
                 await websocket.send_text(json.dumps({"type": "meta_ack"}))
+
+            elif mtype == "save_learning":
+                # 클라이언트에서 학습 데이터 저장 요청을 보냄
+                frames = getattr(collector, "frames", [])
+                session_meta = getattr(collector, "meta", {})
+                asyncio.create_task(
+                    schedule_learning_save(frames=frames, session_id=session_id, meta=session_meta)
+                )
+                await websocket.send_text(json.dumps({"type": "learning_ack", "status": "accepted"}))
+
             elif mtype == "flush":
-                # 클라이언트가 flush 시그널을 보내면 추론 실행
-                # 실제 구현에서는 바이트 프레임 리스트를 수집하여 run_inference 호출
+                # 클라이언트가 flush 시그널을 보내면 추론 실행하고, 추론 결과를 저장 스케줄링합니다.
                 predictor = app.state.ss.predictor
                 frames = getattr(collector, "frames", [])
+
+                # run_inference는 predictor가 None일 수 있으므로 내부에서 처리하도록 합니다.
                 result = run_inference(predictor, frames)
+
+                # 세션 메타(있다면)를 포함해 퀴즈 저장을 백그라운드로 스케줄합니다.
+                session_meta = getattr(collector, "meta", {})
+                asyncio.create_task(
+                    schedule_quiz_save(frames=frames, inference_result=result, session_id=session_id, meta=session_meta)
+                )
+
+                # 클라이언트로 추론 결과 전송
                 await websocket.send_text(json.dumps({"type": "inference_result", "result": result}))
             else:
                 # 기타 메시지: 무시 또는 에코

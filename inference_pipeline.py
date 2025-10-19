@@ -168,24 +168,72 @@ class SequenceCollector:
 
 
 # ------------------ Background saving scheduler ------------------
-async def schedule_quiz_save(frames: List[bytes], inference_result: Dict[str, Any], session_id: Optional[str] = None):
+try:
+    # `storage` 패키지에서 통일된 인터페이스를 가져옵니다. (현재는 local_file_saver로 연결되어 있음)
+    from storage import save_quiz, save_learning
+except Exception:
+    # 테스트/개발 환경에서 저장 모듈이 없을 경우 더미 구현을 사용합니다.
+    async def save_quiz(*args, **kwargs):
+        print("[inference_pipeline] save_quiz dummy called")
+        return {"ok": False, "reason": "no_storage"}
+
+    async def save_learning(*args, **kwargs):
+        print("[inference_pipeline] save_learning dummy called")
+        return {"ok": False, "reason": "no_storage"}
+
+
+async def schedule_quiz_save(frames: List[bytes], inference_result: Dict[str, Any], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
     """
     추론 완료 후 퀴즈 결과를 비동기적으로 저장하도록 스케줄합니다.
-    실제 저장 모듈이 없으면 더미 동작으로 로그만 남깁니다.
+    - frames에서 랜드마크 시퀀스를 추출하고, 저장 인터페이스로 전달합니다.
+    - meta는 웹소켓 세션에서 수집한 메타데이터(예: user_id, word_pk 등)를 전달합니다.
     """
-    try:
-        # 상대 경로 import로 강결합을 피하고, 없을 경우 예외를 잡습니다.
-        from storage.s3_db_saver import save_quiz
+    if meta is None:
+        meta = {}
 
-        # save_quiz는 async 함수로 구현되어 있어야 합니다.
-        res = await save_quiz(frames=frames, inference_result=inference_result, session_id=session_id)
+    try:
+        if extract_sequence_from_frames is None:
+            landmark_sequence = None
+        else:
+            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
+
+        res = await save_quiz(
+            landmark_sequence=landmark_sequence,
+            inference_result=inference_result,
+            session_id=session_id or (inference_result.get("session_id") if isinstance(inference_result, dict) else "unknown"),
+            meta=meta,
+        )
         print(f"[inference_pipeline] Quiz save result: {res}")
 
     except Exception as e:
-        print(f"[inference_pipeline][WARN] save_quiz not available or failed: {e}")
-        # 간단한 대체 동작: 로컬에 임시 파일을 저장하거나 로그 처리(여기서는 로그)
-        await asyncio.sleep(0.01)
-        print("[inference_pipeline] Quiz save skipped (dummy).")
+        print(f"[inference_pipeline][ERROR] Quiz save failed: {e}")
+        traceback.print_exc()
+
+
+async def schedule_learning_save(frames: List[bytes], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
+    """
+    학습 데이터 저장을 비동기적으로 스케줄합니다.
+    - frames에서 랜드마크 시퀀스를 추출하여 저장 인터페이스로 전달합니다.
+    """
+    if meta is None:
+        meta = {}
+
+    try:
+        if extract_sequence_from_frames is None:
+            landmark_sequence = None
+        else:
+            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
+
+        res = await save_learning(
+            landmark_sequence=landmark_sequence,
+            session_id=session_id or meta.get("session_id", "unknown"),
+            meta=meta,
+        )
+        print(f"[inference_pipeline] Learning save result: {res}")
+
+    except Exception as e:
+        print(f"[inference_pipeline][ERROR] Learning save failed: {e}")
+        traceback.print_exc()
 
 
 # 유틸: synchronous run_inference를 다른 쓰레드/태스크에서 호출할 때 사용하는 래퍼
