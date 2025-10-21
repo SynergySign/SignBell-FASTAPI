@@ -338,19 +338,29 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
 if __name__ == "__main__":
     import uvicorn
+    from pathlib import Path  # pathlib를 import합니다.
 
-    ssl_cert_path = BASE_DIR / "certs" / "cert.pem"
-    ssl_key_path = BASE_DIR / "certs" / "key.pem"
+    # 1. mkcert로 생성한 인증서의 절대 경로를 지정합니다.
+    # (Python에서는 C:\certs\... 보다 C:/certs/... (슬래시)를 쓰는 것이 편합니다)
+    ssl_cert_path = Path("C:/certs/localhost+1.pem")
+    ssl_key_path = Path("C:/certs/localhost+1-key.pem")
 
+    # 2. 해당 경로에 mkcert 인증서 파일이 있는지 확인합니다.
     if not ssl_cert_path.is_file() or not ssl_key_path.is_file():
-        print("[WARN] SSL certificates not found. Running without HTTPS.")
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        print(f"[ERROR] mkcert SSL certificates not found at C:/certs/")
+        print("Check if 'localhost+1.pem' and 'localhost+1-key.pem' exist.")
+        print("Server cannot start with HTTPS.")
     else:
-        print("[INFO] Starting server with HTTPS.")
+        print("[INFO] Starting server with mkcert HTTPS.")
         uvicorn.run(
-            app,
-            host="0.0.0.0",
+            app,  # 'app' 변수는 이 파일 상단 어딘가에 정의되어 있어야 합니다.
+
+            # 3. host를 127.0.0.1로 변경합니다.
+            # (Vite 프록시가 127.0.0.1을 바라보고, mkcert 인증서도 localhost/127.0.0.1용입니다)
+            host="127.0.0.1",
             port=8000,
+
+            # 4. mkcert 파일 경로를 문자열(str)로 전달합니다.
             ssl_keyfile=str(ssl_key_path),
             ssl_certfile=str(ssl_cert_path),
         )
