@@ -29,11 +29,10 @@ from types import SimpleNamespace
 import asyncio
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from security.jwt_validator import validate_token_and_get_user_id
 
 from configs import settings
-from routers import internal as internal_router
 from routers import diagnostics as diagnostics_router
 
 # --- 중요 의존성 ---
@@ -255,24 +254,71 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """간단한 WebSocket 시그널링 엔드포인트.
 
     동작:
-    - 쿼리 파라미터 `token`을 받아 JWT를 검증합니다. 실패 시 연결을 닫습니다.
+    - 쿠키(HTTP-only)로 전달된 JWT를 검증합니다. 실패 시 연결을 닫습니다.
     - 텍스트 메시지로 `{"type": "meta", "word_pk": .., "word_name": ..}`를 수신하면
       app.state.ss.collectors[session_id]에 해당 메타를 저장합니다.
     - 클라이언트가 연결을 유지하면서 DataChannel으로 프레임을 전송한다고 가정합니다.
     """
-    # 먼저 토큰 검증
-    # WS 쿠키 기반 인증: 쿼리 파라미터 방식은 더 이상 사용하지 않습니다.
+    # WebSocket 핸드셰이크 로그: 간단히 들어온 헤더/쿠키/쿼리와 토큰 추출 결과를 찍습니다.
     try:
-        token = websocket.cookies.get(settings.COOKIE_ACCESS_TOKEN_NAME)
+        try:
+            headers_dict = dict(websocket.headers)
+        except Exception:
+            headers_dict = {}
+        try:
+            cookies_dict = websocket.cookies or {}
+        except Exception:
+            cookies_dict = {}
+        try:
+            query_dict = dict(websocket.query_params)
+        except Exception:
+            query_dict = {}
+
+        print(f"[WS HANDSHAKE] session_id={session_id} path={getattr(websocket, 'url', None)}")
+        print("[WS HANDSHAKE] headers:", headers_dict)
+        print("[WS HANDSHAKE] cookies:", cookies_dict)
+        print("[WS HANDSHAKE] query_params:", query_dict)
+
+        # Token extraction: prefer cookie, then Authorization header, then query param 'token'
+        token = None
+        token_source = None
+        try:
+            token = websocket.cookies.get(settings.COOKIE_ACCESS_TOKEN_NAME)
+            if token:
+                token_source = f"cookie({settings.COOKIE_ACCESS_TOKEN_NAME})"
+        except Exception:
+            token = None
+
         if not token:
-            # 인증 토큰이 없는 경우 연결 거부 (401을 Close 코드로 사용)
+            auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
+            if auth_header:
+                parts = auth_header.split()
+                if len(parts) == 2 and parts[0].lower() == "bearer":
+                    token = parts[1]
+                    token_source = "authorization_header"
+
+        if not token:
+            token = websocket.query_params.get("token")
+            if token:
+                token_source = "query_param"
+
+        print("[WS HANDSHAKE] resolved token source:", token_source is not None, token_source)
+
+        if not token:
+            print(f"[WS AUTH] No token found for session {session_id} - rejecting handshake")
             await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
             return
 
-        # 토큰 검증 (검증 실패 시 HTTPException이 발생합니다)
-        user_id = validate_token_and_get_user_id(token)
-    except Exception:
-        # 검증 실패 또는 내부 오류 시 연결 거부
+        # Validate token and log result
+        try:
+            user_id = validate_token_and_get_user_id(token)
+            print(f"[WS AUTH] token validated for user_id={user_id}")
+        except Exception as e:
+            print(f"[WS AUTH] token validation failed: {e}")
+            await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
+            return
+    except Exception as _e:
+        print("[WS HANDSHAKE][ERROR] Unexpected handshake error:", _e)
         await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
         return
 
@@ -334,6 +380,28 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # 연결 종료 시 리소스 정리
         app.state.ss.collectors.pop(session_id, None)
         return
+
+
+# 개발 편의용: 브라우저에서 테스트를 위해 토큰 쿠키를 설정하는 엔드포인트
+@app.get('/debug/set-cookie')
+async def debug_set_cookie(token: str):
+    """개발 편의용: 브라우저에서 테스트를 위해 토큰 쿠키를 설정합니다.
+
+    사용 예: /debug/set-cookie?token=eyJ... (개발 환경에서만 사용하세요)
+    이 엔드포인트는 실서비스에선 제거하거나 인증된 경로로 보호되어야 합니다.
+    """
+    resp = JSONResponse({"ok": True, "msg": "cookie set"})
+    # HttpOnly로 설정하여 JS에서 읽을 수 없도록 하는 것이 권장되지만,
+    # 개발 중에는 필요에 따라 변경 가능합니다.
+    resp.set_cookie(
+        key=settings.COOKIE_ACCESS_TOKEN_NAME,
+        value=token,
+        max_age=getattr(settings, 'COOKIE_ACCESS_TOKEN_MAX_AGE', None),
+        httponly=True,
+        secure=False,
+        samesite='lax'
+    )
+    return resp
 
 
 if __name__ == "__main__":

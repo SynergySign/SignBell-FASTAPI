@@ -88,10 +88,38 @@ uvicorn main:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs\key.pem --ssl-ce
 ## React(프론트엔드)에서 연결하는 방법 — 자세한 단계
 목표: 브라우저(React)가 카메라를 캡처하여 서버의 DataChannel로 JPEG(또는 바이너리 프레임)를 전송하고, 서버에서 추론 결과를 받도록 구현합니다.
 
-사전 요구
-- 브라우저에서 HTTPS로 접근(또는 localhost에서 개발시 로컬 인증서로 신뢰된 HTTPS)
-- 서버가 HTTPS로 실행되어 있어야 함(wss 사용 가능)
-- DataChannel label: 'frames' (서버가 동일하게 수신하도록 설계됨)
+- 사전 요구
+  - 브라우저에서 HTTPS로 접근(또는 localhost에서 개발시 로컬 인증서로 신뢰된 HTTPS)
+  - 서버가 HTTPS로 실행되어 있어야 함(wss 사용 가능)
+  - DataChannel label: 'frames' (서버가 동일하게 수신하도록 설계됨)
+
+- 인증(토큰) 전송 방식 요약
+  - 본 프로젝트의 WebSocket 핸드셰이크에서 서버는 토큰을 다음 우선순위로 검사합니다:
+    1) HTTP 쿠키 (key: `configs.settings.COOKIE_ACCESS_TOKEN_NAME`, 기본값 `ACCESS_TOKEN`) — 브라우저 클라이언트 권장
+    2) Authorization 헤더: `Authorization: Bearer <token>` — 서버사이드/스크립트 클라이언트 권장
+    3) 쿼리 파라미터: `?token=<token>` (fallback)
+
+  따라서 외부(서버사이드) 클라이언트는 Authorization 헤더를 사용해 WebSocket을 열고, 브라우저는 로그인 응답에서 `Set-Cookie`로 토큰을 발급하거나 개발용 `GET /debug/set-cookie?token=...` 엔드포인트로 테스트용 쿠키를 설정하면 됩니다.
+
+  간단한 예시
+  - Node.js (서버사이드, Authorization 헤더로 연결)
+    - wss://your.server/ws/<session_id>로 연결 시 요청 헤더에 `Authorization: Bearer <token>`을 포함하세요.
+  - Python (서버사이드, websockets 라이브러리 사용)
+    - websockets.connect(..., extra_headers=[("Authorization","Bearer <token>")]) 형태로 연결하세요.
+  - 브라우저(React) 방식
+    - 브라우저는 WebSocket API로 임의 헤더를 설정할 수 없으므로, 로그인 시 서버가 `Set-Cookie`로 토큰을 발급하거나 테스트 시 `/debug/set-cookie?token=...`를 사용해 쿠키를 설정한 뒤 일반적인 `new WebSocket('wss://.../ws/<session_id>')`로 연결하세요.
+
+- 설정(환경변수 및 defaults) 정리
+  - 서버 설정은 `configs/settings.py`에서 관리됩니다. 주요 항목과 기본값은 다음과 같습니다:
+    - JWT_SECRET_KEY: (환경변수) - JWT 서명 키
+    - JWT_ALGORITHM: HS256
+    - COOKIE_ACCESS_TOKEN_NAME: ACCESS_TOKEN
+    - COOKIE_ACCESS_TOKEN_MAX_AGE: 3600
+    - SSL_CERT_PATH / SSL_KEY_PATH: certs/cert.pem / certs/key.pem (로컬 테스트용)
+    - TARGET_FRAME_COUNT, COLLECTION_DURATION_SECONDS, MAX_FRAMES_TO_COLLECT: 프레임 수집/추론 튜닝 파라미터
+
+- YAML 파일 관련
+  - 현재 저장소에는 `*.yml` 또는 `*.yaml` 설정 파일이 없습니다. 외부 클라이언트와 맞춰야 할 설정은 환경변수(또는 `configs/settings.py`)를 통해 전달하시기 바랍니다. 필요하시면 예시 `docker-compose.yml` 또는 `appsettings.yml`을 제가 만들어 드릴 수 있습니다.
 
 간단한 단계 요약
 1) React에서 `RTCPeerConnection` 생성
