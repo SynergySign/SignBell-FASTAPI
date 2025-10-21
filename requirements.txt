@@ -3,6 +3,11 @@ uvicorn[standard]==0.29.0 # FastAPI 서버를 실행하는 데 사용되는 서�
 aiortc==1.14.0            # WebRTC 데이터 채널 통신을 위한 라이브러리
 python-multipart==0.0.9  # 파일 업로드 등 멀티파트 폼 데이터를 처리하기 위해 필요
 
+# === JWT 라이브러리 (권장) ===
+# 하나만 설치하면 되지만, 프로젝트는 python-jose를 우선 사용하며 PyJWT를 대체로 지원합니다.
+python-jose[cryptography]
+PyJWT[crypto]
+
 # === 머신러닝 및 영상 처리 라이브러리 ===
 # 아래 라이브러리들은 설치에 시간이 오래 걸릴 수 있습니다.
 torch==2.2.0             # 모델 추론을 위한 파이토치 라이브러리

@@ -83,6 +83,15 @@ BASE_DIR = Path(__file__).resolve().parent
 async def lifespan(app: FastAPI):
     """앱 수명주기: 시작 시 Predictor 로드 시도 (기존 on_event('startup') 대체)."""
     print("[STARTUP] Attempting to load Predictor...")
+    try:
+        # Log JWT config (masked secret) for debugging environment loading
+        alg = getattr(settings, 'JWT_ALGORITHM', None)
+        secret = getattr(settings, 'JWT_SECRET_KEY', None) or ''
+        masked = (secret[:4] + '...' + secret[-4:]) if len(secret) > 8 else ('*' * len(secret))
+        print(f"[STARTUP] JWT_ALGORITHM={alg} JWT_SECRET_KEY={masked}")
+    except Exception:
+        pass
+
     # 이미 로드되어 있으면 재사용
     if getattr(app.state, 'ss', None) and getattr(app.state.ss, 'predictor', None):
         print("[STARTUP] Predictor already initialized.")
@@ -309,6 +318,41 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
             return
 
+        # --- 개발용 디버그: 서명 검증 전에 토큰의 헤더/페이로드(검증하지 않음)를 출력합니다. ---
+        try:
+            # 우선 python-jose 방식
+            try:
+                from jose import jwt as _jose_jwt
+                try:
+                    hdr = _jose_jwt.get_unverified_header(token)
+                except Exception:
+                    hdr = None
+                try:
+                    claims = _jose_jwt.get_unverified_claims(token)
+                except Exception:
+                    claims = None
+                print("[WS DEBUG] unverified token header:", hdr)
+                print("[WS DEBUG] unverified token payload:", claims)
+            except Exception:
+                # PyJWT 폴백
+                try:
+                    import jwt as _pyjwt
+                    try:
+                        hdr = _pyjwt.get_unverified_header(token)
+                    except Exception:
+                        hdr = None
+                    try:
+                        claims = _pyjwt.decode(token, options={"verify_signature": False})
+                    except Exception:
+                        claims = None
+                    print("[WS DEBUG] unverified token header:", hdr)
+                    print("[WS DEBUG] unverified token payload:", claims)
+                except Exception as _e:
+                    print("[WS DEBUG] failed to parse token unverified:", _e)
+        except Exception as _e:
+            print("[WS DEBUG] unexpected error while logging token unverified:", _e)
+        # ---------------------------------------------------------------------------
+
         # Validate token and log result
         try:
             user_id = validate_token_and_get_user_id(token)
@@ -432,3 +476,4 @@ if __name__ == "__main__":
             ssl_keyfile=str(ssl_key_path),
             ssl_certfile=str(ssl_cert_path),
         )
+

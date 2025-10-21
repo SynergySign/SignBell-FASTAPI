@@ -18,21 +18,38 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 import os
 
-# Try to import python-jose; if unavailable provide a dummy implementation that raises
+# Try to import python-jose; if unavailable try PyJWT; otherwise provide a clear dummy that raises.
 try:
     from jose import JWTError, jwt  # type: ignore
     _HAVE_JOSE = True
 except Exception:
-    # Provide fallbacks so module import does not fail when `python-jose` is not installed.
-    JWTError = Exception  # type: ignore
-    _HAVE_JOSE = False
+    # Try PyJWT as a fallback.
+    try:
+        import jwt as _pyjwt  # PyJWT
+        from jwt import InvalidTokenError as PyJWTInvalidTokenError
 
-    class _DummyJWT:
-        @staticmethod
-        def decode(token: str, key: str, algorithms: list[str]):
-            raise RuntimeError("python-jose is not installed. Install with `pip install python-jose[cryptography]` to enable JWT decoding.")
+        class _PyJWTWrapper:
+            @staticmethod
+            def decode(token: str, key: str, algorithms: list[str]):
+                # PyJWT's decode signature: jwt.decode(token, key, algorithms=algorithms)
+                return _pyjwt.decode(token, key, algorithms=algorithms)
 
-    jwt = _DummyJWT()  # type: ignore
+        jwt = _PyJWTWrapper()  # type: ignore
+        JWTError = PyJWTInvalidTokenError  # type: ignore
+        _HAVE_JOSE = False
+    except Exception:
+        # Provide fallbacks so module import does not fail when neither library is installed.
+        JWTError = Exception  # type: ignore
+        _HAVE_JOSE = False
+
+        class _DummyJWT:
+            @staticmethod
+            def decode(token: str, key: str, algorithms: list[str]):
+                raise RuntimeError(
+                    "No JWT library installed. Install one: `pip install python-jose[cryptography]` or `pip install pyjwt[crypto]`"
+                )
+
+        jwt = _DummyJWT()  # type: ignore
 
 from configs import settings
 
@@ -45,16 +62,36 @@ def _decode_jwt(token: str) -> dict[str, Any]:
 
     Raises HTTPException(401) on any verification error.
     """
+    # Try direct decode first
     try:
         payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
         return payload
-    except Exception as exc:
-        # Catch any error from jwt.decode (including missing dependency) and translate to HTTPException
+    except Exception as first_exc:
+        # If signature verification failed, and the configured secret looks like base64,
+        # try base64-decoding the secret and verify again (common when secrets are stored base64-encoded).
+        import base64
+        try:
+            secret_val = settings.JWT_SECRET_KEY or ""
+            # Heuristic: contains only base64 chars and maybe '=' padding, or ends with '='
+            b64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+            if secret_val and all(c in b64_chars for c in secret_val):
+                try:
+                    decoded = base64.b64decode(secret_val)
+                    # Try decode with decoded bytes (jwt libs accept str or bytes)
+                    payload = jwt.decode(token, decoded, algorithms=[settings.JWT_ALGORITHM])
+                    return payload
+                except Exception:
+                    # swallow and raise unified exception below
+                    pass
+        except Exception:
+            pass
+
+        # Unified HTTPException with helpful message
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Could not validate credentials: {str(exc)}",
+            detail=f"Could not validate credentials: {str(first_exc)}",
             headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        ) from first_exc
 
 
 def _extract_token_from_request(request: Request) -> Optional[str]:

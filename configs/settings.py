@@ -17,6 +17,21 @@ author: 백승현
 # This keeps the project runnable even when pydantic v2/pydantic-settings are not installed.
 from functools import lru_cache
 import os
+from pathlib import Path
+
+# Try to load a .env file automatically for local development if python-dotenv is available.
+try:
+    from dotenv import load_dotenv
+    # Look for .env in repository root (two levels up from configs/settings.py)
+    env_path = Path(__file__).resolve().parent.parent / '.env'
+    if env_path.is_file():
+        load_dotenv(dotenv_path=str(env_path))
+    else:
+        # fallback: call load_dotenv() with default behavior (cwd)
+        load_dotenv()
+except Exception:
+    # python-dotenv not installed; continue using os.environ only
+    pass
 
 
 class Settings:
@@ -31,8 +46,11 @@ class Settings:
         self.MAX_FRAMES_TO_COLLECT: int = int(os.getenv("MAX_FRAMES_TO_COLLECT", "1024"))
 
         # SSL (optional)
-        self.SSL_CERT_PATH: str = os.getenv("SSL_CERT_PATH", "certs/cert.pem")
-        self.SSL_KEY_PATH: str = os.getenv("SSL_KEY_PATH", "certs/key.pem")
+        # 기본값을 로컬 개발에서 사용중인 Windows 경로로 설정합니다. 환경변수로 덮어쓸 수 있습니다.
+        default_cert = str(Path("C:/certs/localhost+1.pem"))
+        default_key = str(Path("C:/certs/localhost+1-key.pem"))
+        self.SSL_CERT_PATH: str = os.getenv("SSL_CERT_PATH", default_cert)
+        self.SSL_KEY_PATH: str = os.getenv("SSL_KEY_PATH", default_key)
 
         # Cookie settings (used for cookie-based token extraction)
         # Default name kept as ACCESS_TOKEN to match Spring's suggested CookieProperties
