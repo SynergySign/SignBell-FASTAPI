@@ -19,21 +19,19 @@ author: 백승현
 
 from __future__ import annotations
 
-import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-import asyncio
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
-from security.jwt_validator import validate_token_and_get_user_id
 
 from configs import settings
 from routers import diagnostics as diagnostics_router
+from ws_handler import websocket_handler
 
 # --- 중요 의존성 ---
 # 일부 라이브러리는 개발환경에 설치되어 있지 않을 수 있으므로 안전하게 임포트합니다.
@@ -41,7 +39,6 @@ HEAVY_IMPORTS_AVAILABLE = True
 try:
     import torch
     import numpy as np
-    from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
 
     from processing.predictor import Predictor, get_predictor, CNN_BiLSTM_Attention, PositionalEncoding
     from processing.landmark_extractor import extract_sequence_from_frames, FRAME_FEATURE_DIM
@@ -53,10 +50,6 @@ except Exception as _e:
 
     torch = None
     np = None
-    # aiortc 관련 객체는 None으로 대체
-    RTCPeerConnection = None
-    RTCSessionDescription = None
-    RTCIceCandidate = None
 
     # Predictor 등은 None / 더미로 대체 (get_predictor은 None을 반환하도록 설정)
     Predictor = None
@@ -130,9 +123,6 @@ app.state = SimpleNamespace()
 # app.include_router(internal_router.router)
 app.include_router(diagnostics_router.router)
 
-# Import storage scheduling helpers from inference pipeline
-from inference_pipeline import schedule_quiz_save, schedule_learning_save
-
 
 # ----------------------------- 모델 및 추론 로직 -----------------------------
 
@@ -182,7 +172,8 @@ class AppState:
         # 위 주입이 완료된 이후에 predictor를 로드하도록 합니다.
         self.predictor: Optional["Predictor"] = get_predictor() if HEAVY_IMPORTS_AVAILABLE else None
 
-        self.active_peers: Dict[str, "RTCPeerConnection"] = {}
+        # aiortc를 사용하지 않으므로 Any로 타입 지정
+        self.active_peers: Dict[str, Any] = {}
         self.collectors: Dict[str, SequenceCollector] = {}
 
     def new_collector(self, session_id: str) -> SequenceCollector:
@@ -260,192 +251,20 @@ async def simulate_predict():
 # === WebSocket 시그널링 엔드포인트 ===
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """간단한 WebSocket 시그널링 엔드포인트.
-
-    동작:
-    - 쿠키(HTTP-only)로 전달된 JWT를 검증합니다. 실패 시 연결을 닫습니다.
-    - 텍스트 메시지로 `{"type": "meta", "word_pk": .., "word_name": ..}`를 수신하면
-      app.state.ss.collectors[session_id]에 해당 메타를 저장합니다.
-    - 클라이언트가 연결을 유지하면서 DataChannel으로 프레임을 전송한다고 가정합니다.
-    """
-    # WebSocket 핸드셰이크 로그: 간단히 들어온 헤더/쿠키/쿼리와 토큰 추출 결과를 찍습니다.
+    """WebSocket 엔드포인트 래퍼: 실제 로직은 `ws_handler.websocket_handler`에 위임합니다."""
     try:
-        try:
-            headers_dict = dict(websocket.headers)
-        except Exception:
-            headers_dict = {}
-        try:
-            cookies_dict = websocket.cookies or {}
-        except Exception:
-            cookies_dict = {}
-        try:
-            query_dict = dict(websocket.query_params)
-        except Exception:
-            query_dict = {}
-
-        print(f"[WS HANDSHAKE] session_id={session_id} path={getattr(websocket, 'url', None)}")
-        print("[WS HANDSHAKE] headers:", headers_dict)
-        print("[WS HANDSHAKE] cookies:", cookies_dict)
-        print("[WS HANDSHAKE] query_params:", query_dict)
-
-        # Token extraction: prefer cookie, then Authorization header, then query param 'token'
-        token = None
-        token_source = None
-        try:
-            token = websocket.cookies.get(settings.COOKIE_ACCESS_TOKEN_NAME)
-            if token:
-                token_source = f"cookie({settings.COOKIE_ACCESS_TOKEN_NAME})"
-        except Exception:
-            token = None
-
-        if not token:
-            auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
-            if auth_header:
-                parts = auth_header.split()
-                if len(parts) == 2 and parts[0].lower() == "bearer":
-                    token = parts[1]
-                    token_source = "authorization_header"
-
-        if not token:
-            token = websocket.query_params.get("token")
-            if token:
-                token_source = "query_param"
-
-        print("[WS HANDSHAKE] resolved token source:", token_source is not None, token_source)
-
-        if not token:
-            print(f"[WS AUTH] No token found for session {session_id} - rejecting handshake")
-            await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
-            return
-
-        # --- 개발용 디버그: 서명 검증 전에 토큰의 헤더/페이로드(검증하지 않음)를 출력합니다. ---
-        try:
-            # 우선 python-jose 방식
-            try:
-                from jose import jwt as _jose_jwt
-                try:
-                    hdr = _jose_jwt.get_unverified_header(token)
-                except Exception:
-                    hdr = None
-                try:
-                    claims = _jose_jwt.get_unverified_claims(token)
-                except Exception:
-                    claims = None
-                print("[WS DEBUG] unverified token header:", hdr)
-                print("[WS DEBUG] unverified token payload:", claims)
-            except Exception:
-                # PyJWT 폴백
-                try:
-                    import jwt as _pyjwt
-                    try:
-                        hdr = _pyjwt.get_unverified_header(token)
-                    except Exception:
-                        hdr = None
-                    try:
-                        claims = _pyjwt.decode(token, options={"verify_signature": False})
-                    except Exception:
-                        claims = None
-                    print("[WS DEBUG] unverified token header:", hdr)
-                    print("[WS DEBUG] unverified token payload:", claims)
-                except Exception as _e:
-                    print("[WS DEBUG] failed to parse token unverified:", _e)
-        except Exception as _e:
-            print("[WS DEBUG] unexpected error while logging token unverified:", _e)
-        # ---------------------------------------------------------------------------
-
-        # Validate token and log result
-        try:
-            user_id = validate_token_and_get_user_id(token)
-            print(f"[WS AUTH] token validated for user_id={user_id}")
-        except Exception as e:
-            print(f"[WS AUTH] token validation failed: {e}")
-            await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
-            return
-    except Exception as _e:
-        print("[WS HANDSHAKE][ERROR] Unexpected handshake error:", _e)
-        await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
-        return
-
-    await websocket.accept()
-
-    # 세션용 collector가 없으면 새로 생성
-    collector = app.state.ss.collectors.get(session_id) or app.state.ss.new_collector(session_id)
-
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                # 텍스트가 JSON이 아닌 경우 무시
-                continue
-
-            mtype = msg.get("type")
-            if mtype == "meta":
-                # 단어 메타데이터를 세션 상태에 저장만 합니다 (저장 스케줄링은 제거)
-                collector.meta = {
-                    "word_pk": msg.get("word_pk"),
-                    "word_name": msg.get("word_name"),
-                    "user_id": user_id,
-                }
-
-                # 클라이언트로 메타 수신 확인 응답만 보냅니다.
-                await websocket.send_text(json.dumps({"type": "meta_ack"}))
-
-            elif mtype == "save_learning":
-                # 클라이언트에서 학습 데이터 저장 요청을 보냄
-                frames = getattr(collector, "frames", [])
-                session_meta = getattr(collector, "meta", {})
-                asyncio.create_task(
-                    schedule_learning_save(frames=frames, session_id=session_id, meta=session_meta)
-                )
-                await websocket.send_text(json.dumps({"type": "learning_ack", "status": "accepted"}))
-
-            elif mtype == "flush":
-                # 클라이언트가 flush 시그널을 보내면 추론 실행하고, 추론 결과를 저장 스케줄링합니다.
-                predictor = app.state.ss.predictor
-                frames = getattr(collector, "frames", [])
-
-                # run_inference는 predictor가 None일 수 있으므로 내부에서 처리하도록 합니다.
-                result = run_inference(predictor, frames)
-
-                # 세션 메타(있다면)를 포함해 퀴즈 저장을 백그라운드로 스케줄합니다.
-                session_meta = getattr(collector, "meta", {})
-                asyncio.create_task(
-                    schedule_quiz_save(frames=frames, inference_result=result, session_id=session_id, meta=session_meta)
-                )
-
-                # 클라이언트로 추론 결과 전송
-                await websocket.send_text(json.dumps({"type": "inference_result", "result": result}))
-            else:
-                # 기타 메시지: 무시 또는 에코
-                await websocket.send_text(json.dumps({"type": "noop"}))
+        await websocket_handler(websocket, session_id, app.state.ss)
     except WebSocketDisconnect:
-        # 연결 종료 시 리소스 정리
         app.state.ss.collectors.pop(session_id, None)
-        return
+    except Exception as e:
+        print("[WS][ERROR] websocket_endpoint wrapper error:", e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        app.state.ss.collectors.pop(session_id, None)
 
 
-# 개발 편의용: 브라우저에서 테스트를 위해 토큰 쿠키를 설정하는 엔드포인트
-@app.get('/debug/set-cookie')
-async def debug_set_cookie(token: str):
-    """개발 편의용: 브라우저에서 테스트를 위해 토큰 쿠키를 설정합니다.
-
-    사용 예: /debug/set-cookie?token=eyJ... (개발 환경에서만 사용하세요)
-    이 엔드포인트는 실서비스에선 제거하거나 인증된 경로로 보호되어야 합니다.
-    """
-    resp = JSONResponse({"ok": True, "msg": "cookie set"})
-    # HttpOnly로 설정하여 JS에서 읽을 수 없도록 하는 것이 권장되지만,
-    # 개발 중에는 필요에 따라 변경 가능합니다.
-    resp.set_cookie(
-        key=settings.COOKIE_ACCESS_TOKEN_NAME,
-        value=token,
-        max_age=getattr(settings, 'COOKIE_ACCESS_TOKEN_MAX_AGE', None),
-        httponly=True,
-        secure=False,
-        samesite='lax'
-    )
-    return resp
 
 
 if __name__ == "__main__":
@@ -476,4 +295,3 @@ if __name__ == "__main__":
             ssl_keyfile=str(ssl_key_path),
             ssl_certfile=str(ssl_cert_path),
         )
-
