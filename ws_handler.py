@@ -186,10 +186,27 @@ async def websocket_handler(websocket: WebSocket, session_id: str, app_state: An
                             print(f"[WS][WARN] landmark extraction failed for save_learning: {e}")
                             landmark_sequence = None
 
-                    asyncio.create_task(
-                        schedule_learning_save(landmark_sequence=landmark_sequence, session_id=session_id, meta=session_meta)
-                    )
-                    await websocket.send_text(json.dumps({"type": "learning_ack", "status": "accepted"}))
+                    # 랜드마크 추출이 실패한 경우 클라이언트에 실패 응답을 보내고
+                    # 저장 작업은 스케줄하지 않습니다. 성공한 경우에만 저장을 스케줄합니다.
+                    if landmark_sequence is None:
+                        # 실패 사유를 포함하여 즉시 응답
+                        try:
+                            await websocket.send_text(json.dumps({
+                                "type": "learning_ack",
+                                "status": "failed",
+                                "reason": "landmark_extraction_failed",
+                            }))
+                        except Exception as _e:
+                            print(f"[WS][WARN] Failed to send learning failure ack for session {session_id}: {_e}")
+                    else:
+                        # 성공 시에만 비동기 저장을 스케줄
+                        asyncio.create_task(
+                            schedule_learning_save(landmark_sequence=landmark_sequence, session_id=session_id, meta=session_meta)
+                        )
+                        try:
+                            await websocket.send_text(json.dumps({"type": "learning_ack", "status": "accepted"}))
+                        except Exception as _e:
+                            print(f"[WS][WARN] Failed to send learning accepted ack for session {session_id}: {_e}")
 
                 elif mtype == "flush":
                     predictor = app_state.predictor
