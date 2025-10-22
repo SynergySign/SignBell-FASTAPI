@@ -1,12 +1,16 @@
-"""간단한 REST 스모크 테스트 스크립트.
-
-실행 전:
-  1) uvicorn main:app --reload (다른 터미널에서 서버 실행)
-  2) python smoke_test.py
-
-aiortc 설치 여부와 무관하게 동작 가능한 기본 REST 엔드포인트만 검증.
 """
-from __future__ import annotations
+모듈: smoke_test.py
+설명:
+- 기본 REST 엔드포인트에 대한 간단한 스모크 테스트 스크립트입니다.
+- 실행 전 서버(uvicorn)를 띄운 뒤 이 스크립트를 실행하여 주요 엔드포인트가 동작하는지 확인합니다.
+
+사용법:
+  1) uvicorn main:app --reload 로 서버 실행
+  2) python smoke_test.py 로 스모크 테스트 실행
+
+since: 2025.10.17
+author: 백승현
+"""
 
 import json
 import os
@@ -54,6 +58,8 @@ def check(path: str, method: str = "GET"):
 def main():
     print("=== SignSense REST Smoke Test ===")
     print(f"BASE={BASE} TOKEN={'SET' if TOKEN else 'NONE'}")
+
+    # 기본 엔드포인트들
     for path, method in [
         ("/", "GET"),
         ("/health", "GET"),
@@ -61,55 +67,65 @@ def main():
         ("/config", "GET"),
         ("/client", "GET"),  # HTML 테스트 페이지
         ("/simulate/predict", "POST"),
+        ("/api/diagnostics/status", "GET"),
+        ("/api/diagnostics/echo", "POST"),
     ]:
         try:
+            # diagnostics/echo은 POST이므로 body 포함
+            if path == "/api/diagnostics/echo":
+                r = httpx.post(BASE + path, json={"msg": "hello"}, timeout=5)
+                print(f"[POST] {path} -> {r.status_code}")
+                try:
+                    print(pretty(r.json()))
+                except Exception:
+                    print(r.text[:200])
+                print("-" * 60)
+                continue
+
             check(path, method)
         except Exception as e:  # noqa
             print(f"[ERR] {path}: {e}")
 
-    # === Internal endpoints (require JSON bodies) ===
-    try:
-        print("[POST] /internal/save-quiz")
-        r = httpx.post(BASE + "/internal/save-quiz", json={
-            "session_id": "testsession",
-            "inference_result": {"predicted": "테스트", "score": 0.5}
-        }, headers=auth_headers(), timeout=10)
-        print(f"/internal/save-quiz -> {r.status_code}")
+    # === Internal endpoints (require Bearer token) ===
+    if not TOKEN:
+        print("Skipping /api/internal/* tests because INTERNAL_API_TOKEN is not set in environment.")
+    else:
         try:
-            print(pretty(r.json()))
-        except Exception:
-            print(r.text[:200])
-    except Exception as e:  # noqa
-        print(f"[ERR] /internal/save-quiz: {e}")
-    print("-" * 60)
+            print("[POST] /api/internal/save-quiz")
+            # payload matches schemas.SaveQuizRequest: session_id, predicted, score, timings/landmarks_info optional
+            payload_quiz = {
+                "session_id": "testsession",
+                "predicted": "테스트",
+                "score": 0.5,
+                "timings": {"frame_count": 0},
+            }
+            r = httpx.post(BASE + "/api/internal/save-quiz", json=payload_quiz, headers=auth_headers(), timeout=10)
+            print(f"/api/internal/save-quiz -> {r.status_code}")
+            try:
+                print(pretty(r.json()))
+            except Exception:
+                print(r.text[:200])
+        except Exception as e:  # noqa
+            print(f"[ERR] /api/internal/save-quiz: {e}")
+        print("-" * 60)
 
-    # Ensure a collector exists for the learning save test
-    try:
-        print("[POST] /simulate/create-collector (for testsession)")
-        r = httpx.post(BASE + "/simulate/create-collector", json={"session_id": "testsession"}, timeout=5)
-        print(f"/simulate/create-collector -> {r.status_code}")
         try:
-            print(pretty(r.json()))
-        except Exception:
-            print(r.text[:200])
-    except Exception as e:  # noqa
-        print(f"[ERR] /simulate/create-collector: {e}")
-    print("-" * 60)
-
-    try:
-        print("[POST] /internal/save-learning")
-        r = httpx.post(BASE + "/internal/save-learning", json={
-            "session_id": "testsession",
-            "meta": {"label": "안녕", "source": "smoke_test"}
-        }, headers=auth_headers(), timeout=10)
-        print(f"/internal/save-learning -> {r.status_code}")
-        try:
-            print(pretty(r.json()))
-        except Exception:
-            print(r.text[:200])
-    except Exception as e:  # noqa
-        print(f"[ERR] /internal/save-learning: {e}")
-    print("-" * 60)
+            print("[POST] /api/internal/save-learning")
+            # payload matches schemas.SaveLearningRequest: session_id, word, metadata optional
+            payload_learning = {
+                "session_id": "testsession",
+                "word": "안녕",
+                "metadata": {"source": "smoke_test"}
+            }
+            r = httpx.post(BASE + "/api/internal/save-learning", json=payload_learning, headers=auth_headers(), timeout=10)
+            print(f"/api/internal/save-learning -> {r.status_code}")
+            try:
+                print(pretty(r.json()))
+            except Exception:
+                print(r.text[:200])
+        except Exception as e:  # noqa
+            print(f"[ERR] /api/internal/save-learning: {e}")
+        print("-" * 60)
 
     print("완료. WebSocket /ws 및 WebRTC 흐름은 브라우저 /client 에서 수동 확인 필요.")
 

@@ -1,23 +1,41 @@
 """
-SignSense Test Server
-- FastAPI 기반 WebSocket 시그널링 + WebRTC DataChannel 프레임 수신 프로토타입
-- 모델 로딩 및 프레임 시퀀스 수집 후 추론 결과 반환
+모듈: main.py
+설명:
+- SignSense Inference Server의 FastAPI 진입점입니다.
+- WebSocket 시그널링 엔드포인트와 간단한 REST 엔드포인트들을 제공하며,
+  모델 로드와 전역 상태(AppState) 관리를 담당합니다.
+- 주요 엔드포인트:
+  - GET  /                 : 서버 상태 확인
+  - GET  /health           : 예측기(모델) 로드 상태 확인
+  - GET  /model/status     : 모델 로드 상태 및 경로 정보 반환
+  - GET  /config           : 서버 구성값 반환
+  - GET  /client           : 테스트용 HTML 클라이언트 제공
+  - POST /simulate/predict: 스모크 테스트용 더미 추론 엔드포인트
+  - WS   /ws/{session_id}  : WebSocket 시그널링 엔드포인트 (token 쿼리 파라미터로 JWT 검증)
+
+since: 2025.10.17
+author: 백승현
 """
+
 from __future__ import annotations
 
 import json
-import os
 import sys
-import time
 import traceback
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+import asyncio
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, BackgroundTasks, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from security.jwt_validator import validate_token_and_get_user_id
 
-# --- Core Dependencies ---
+from configs import settings
+from routers import diagnostics as diagnostics_router
+
+# --- 중요 의존성 ---
 # 일부 라이브러리는 개발환경에 설치되어 있지 않을 수 있으므로 안전하게 임포트합니다.
 HEAVY_IMPORTS_AVAILABLE = True
 try:
@@ -53,30 +71,89 @@ except Exception as _e:
         # 더미 구현: 실제 추론을 위해서는 mediapipe 등 의존성이 필요합니다.
         return None
 
-    FRAME_FEATURE_DIM = 0
+# 중앙 설정에서 값을 가져옵니다 (환경변수는 configs/settings.py에서 처리).
+TARGET_FRAME_COUNT = settings.TARGET_FRAME_COUNT
+COLLECTION_DURATION_SECONDS = settings.COLLECTION_DURATION_SECONDS
+MAX_FRAMES_TO_COLLECT = settings.MAX_FRAMES_TO_COLLECT
 
-
-# --- 상수 정의 ---
 BASE_DIR = Path(__file__).resolve().parent
-TARGET_FRAME_COUNT = int(os.getenv("SIGN_SEQUENCE_TARGET_FRAMES", "300")) # 모델 입력 크기, 수집과 무관
-COLLECTION_DURATION_SECONDS = float(os.getenv("SIGN_SEQUENCE_COLLECTION_SECONDS", "5.0"))
-MAX_FRAMES_TO_COLLECT = 300  # 메모리 보호를 위한 안전장치
 
-app = FastAPI(title="SignSense Inference Server", version="0.2.0")
+# --- FastAPI 앱 초기화 ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """앱 수명주기: 시작 시 Predictor 로드 시도 (기존 on_event('startup') 대체)."""
+    print("[STARTUP] Attempting to load Predictor...")
+    try:
+        # Log JWT config (masked secret) for debugging environment loading
+        alg = getattr(settings, 'JWT_ALGORITHM', None)
+        secret = getattr(settings, 'JWT_SECRET_KEY', None) or ''
+        masked = (secret[:4] + '...' + secret[-4:]) if len(secret) > 8 else ('*' * len(secret))
+        print(f"[STARTUP] JWT_ALGORITHM={alg} JWT_SECRET_KEY={masked}")
+    except Exception:
+        pass
+
+    # 이미 로드되어 있으면 재사용
+    if getattr(app.state, 'ss', None) and getattr(app.state.ss, 'predictor', None):
+        print("[STARTUP] Predictor already initialized.")
+        yield
+        return
+
+    try:
+        # 동적으로 Import 시도하여 실제 운영환경의 종속성을 사용할 수 있게 함
+        from processing.predictor import get_predictor as _get_predictor
+        predictor_instance = _get_predictor()
+        # app.state.ss 가 없을 수 있으므로 안전하게 설정
+        if not getattr(app.state, 'ss', None):
+            app.state.ss = AppState()
+        app.state.ss.predictor = predictor_instance
+        print("[STARTUP] Predictor successfully loaded.")
+    except Exception as e:
+        # 자세한 예외 정보 로그
+        print(f"[STARTUP][ERROR] Failed to load Predictor dynamically: {e}")
+        traceback.print_exc()
+        if not getattr(app.state, 'ss', None):
+            app.state.ss = AppState()
+        app.state.ss.predictor = None
+        print("[STARTUP] Running without Predictor. Install required packages and restart the server for real inference.")
+
+    yield
+    # (선택) 종료 시 정리 로직을 여기에 추가할 수 있습니다.
 
 
-# ----------------------------- Model & Inference Logic -----------------------------
+app = FastAPI(title="SignSense Inference Server", version="0.2.0", lifespan=lifespan)
 
-# Use the shared inference pipeline implementation (separated module)
-from inference_pipeline import run_inference, SequenceCollector, schedule_quiz_save
+# 명시적으로 app.state를 초기화하여 정적 분석기의 'state' 관련 경고를 줄입니다.
+app.state = SimpleNamespace()
+
+# 라우터 등록
+# internal router is deprecated in favor of WebSocket-based flow; keep commented to avoid exposing REST save endpoints
+# app.include_router(internal_router.router)
+app.include_router(diagnostics_router.router)
+
+# Import storage scheduling helpers from inference pipeline
+from inference_pipeline import schedule_quiz_save, schedule_learning_save
 
 
-# ----------------------------- Global State -----------------------------
+# ----------------------------- 모델 및 추론 로직 -----------------------------
+
+# 공통 추론 파이프라인 사용
+from inference_pipeline import run_inference, SequenceCollector
+
+
+# ----------------------------- 전역 상태 -----------------------------
 
 class AppState:
+    """애플리케이션 전역 상태를 보관하는 컨테이너.
+
+    역할/정의:
+    - Predictor 인스턴스, 활성 피어 연결, 세션별 SequenceCollector를 관리합니다.
+
+    since: 2025.10.17
+    author: 백승현
+    """
     def __init__(self):
         # Predictor는 heavy deps가 없으면 None이 됩니다.
-        # --- 모델 로드 오류 해결 ---
+        # ---모델 로드 오류 해결---
         # torch.load가 unpickle 시 특정 모듈명 아래에서 클래스를 찾는 경우가 있어,
         # 필요한 클래스들을 가능한 모듈 이름에 미리 주입한 뒤 모델을 로드합니다.
         import types
@@ -117,27 +194,12 @@ class AppState:
 app.state.ss = AppState()
 
 
-# ----------------------------- Startup Event -----------------------------
+# ----------------------------- 스타트업 이벤트 -----------------------------
 
-@app.on_event("startup")
-async def startup_event():
-    """서버 시작 시 실제 추론 모델(Predictor)을 로드합니다."""
-    print("[STARTUP] Loading predictor...")
-    try:
-        # 상태 초기화 시 이미 로드되었으므로, 여기서는 확인만 합니다.
-        if app.state.ss.predictor:
-            print("[STARTUP] Predictor ready.")
-        else:
-            # 이 경우는 get_predictor() 실패 시 발생
-            raise RuntimeError("Predictor could not be loaded.")
-    except Exception as e:
-        print(f"[STARTUP][FATAL] Failed to load predictor: {e}")
-        # 필수 의존성이므로, 로드 실패 시 프로세스를 종료하거나 상태를 명확히 할 수 있습니다.
-        # 여기서는 에러 로그를 남기고, health check 등에서 감지되도록 합니다.
-        app.state.ss.predictor = None
+# @app.on_event("startup") 블록은 lifespan으로 대체되어 제거되었습니다.
 
 
-# ----------------------------- REST Endpoints -----------------------------
+# ----------------------------- REST 엔드포인트 -----------------------------
 
 @app.get("/")
 async def root():
@@ -160,13 +222,15 @@ async def model_status():
         "device": str(predictor.device) if predictor else "N/A",
     }
 
+
 @app.get("/config")
 async def get_config():
     return {
-        "target_frame_count": TARGET_FRAME_COUNT,
-        "collection_duration_seconds": COLLECTION_DURATION_SECONDS,
-        "max_frames_to_collect": MAX_FRAMES_TO_COLLECT,
+        "target_frame_count": settings.TARGET_FRAME_COUNT,
+        "collection_duration_seconds": settings.COLLECTION_DURATION_SECONDS,
+        "max_frames_to_collect": settings.MAX_FRAMES_TO_COLLECT,
     }
+
 
 @app.get("/client", response_class=HTMLResponse)
 async def serve_client_test_page():
@@ -193,235 +257,223 @@ async def simulate_predict():
     return result
 
 
-@app.post("/simulate/create-collector")
-async def simulate_create_collector(request: Request):
-    """Test helper: create an empty SequenceCollector for given session_id.
-    Body JSON: {"session_id": str}
-    This endpoint is only intended for local testing (smoke_test).
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    session_id = payload.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required")
-
-    # Create a collector (empty) for session
-    collector = app.state.ss.new_collector(session_id)
-    return {"ok": True, "session_id": session_id, "collector_frames": len(collector.frames)}
-
-
-# ----------------------------- Internal storage endpoints -----------------------------
-
-def _check_internal_access(request: Request):
-    """Optional internal access guard.
-    If ENV INTERNAL_API_TOKEN is set, require header 'x-internal-token' to match.
-    Otherwise allow requests from localhost addresses.
-    """
-    token = os.getenv("INTERNAL_API_TOKEN")
-    if token:
-        hdr = request.headers.get("x-internal-token")
-        if hdr != token:
-            raise HTTPException(status_code=403, detail="Forbidden: invalid internal token")
-    else:
-        # If no token configured, allow only local requests as a reasonable default.
-        client = request.client
-        if client is None or client.host not in ("127.0.0.1", "::1", "localhost"):
-            # Not strictly secure in all deployments, but suitable for local/intra-host calls.
-            raise HTTPException(status_code=403, detail="Forbidden: internal endpoint only")
-
-
-@app.post("/internal/save-learning")
-async def internal_save_learning(request: Request):
-    """Internal endpoint to save collected frames for a session as 'learning' data.
-    Body JSON: { "session_id": str, "meta": { ... } }
-    This schedules an async save and returns immediately.
-    """
-    _check_internal_access(request)
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    session_id = payload.get("session_id")
-    meta = payload.get("meta", {})
-
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required")
-
-    collector = app.state.ss.collectors.get(session_id)
-    if collector is None:
-        raise HTTPException(status_code=404, detail="collector not found for session_id")
-
-    frames = collector.frames
-
-    try:
-        # schedule async save_learning
-        from storage.s3_db_saver import save_learning
-        import asyncio
-        asyncio.create_task(save_learning(frames=frames, meta={**meta, "session_id": session_id}))
-        return {"ok": True, "scheduled": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to schedule save_learning: {e}")
-
-
-@app.post("/internal/save-quiz")
-async def internal_save_quiz(request: Request):
-    """Internal endpoint to save quiz inference results. Body JSON: { "session_id": str, "inference_result": {...} }
-    The endpoint will look up frames for session_id (if available) and schedule async save_quiz.
-    """
-    _check_internal_access(request)
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    session_id = payload.get("session_id")
-    inference_result = payload.get("inference_result")
-
-    if not session_id or inference_result is None:
-        raise HTTPException(status_code=400, detail="session_id and inference_result are required")
-
-    collector = app.state.ss.collectors.get(session_id)
-    frames = collector.frames if collector is not None else []
-
-    try:
-        from storage.s3_db_saver import save_quiz
-        import asyncio
-        asyncio.create_task(save_quiz(frames=frames, inference_result=inference_result, session_id=session_id))
-        return {"ok": True, "scheduled": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to schedule save_quiz: {e}")
-
-# ----------------------------- WebSocket Signaling -----------------------------
-
+# === WebSocket 시그널링 엔드포인트 ===
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    await websocket.accept()
-    peer_id = f"peer_{id(websocket)}"
-    print(f"[WS] Connected: {peer_id}")
-    pc = RTCPeerConnection()
-    app.state.ss.active_peers[peer_id] = pc
+    """간단한 WebSocket 시그널링 엔드포인트.
 
-    async def safe_send_json(payload: Dict[str, Any]):
+    동작:
+    - 쿠키(HTTP-only)로 전달된 JWT를 검증합니다. 실패 시 연결을 닫습니다.
+    - 텍스트 메시지로 `{"type": "meta", "word_pk": .., "word_name": ..}`를 수신하면
+      app.state.ss.collectors[session_id]에 해당 메타를 저장합니다.
+    - 클라이언트가 연결을 유지하면서 DataChannel으로 프레임을 전송한다고 가정합니다.
+    """
+    # WebSocket 핸드셰이크 로그: 간단히 들어온 헤더/쿠키/쿼리와 토큰 추출 결과를 찍습니다.
+    try:
         try:
-            await websocket.send_text(json.dumps(payload))
-        except WebSocketDisconnect:
-            print(f"[WS][SEND][WARN] Peer {peer_id} disconnected before sending.")
-        except Exception as e:
-            print(f"[WS][SEND][ERR] for {peer_id}: {e}")
+            headers_dict = dict(websocket.headers)
+        except Exception:
+            headers_dict = {}
+        try:
+            cookies_dict = websocket.cookies or {}
+        except Exception:
+            cookies_dict = {}
+        try:
+            query_dict = dict(websocket.query_params)
+        except Exception:
+            query_dict = {}
 
-    # --- 데이터 채널 콜백 정의 ---
-    @pc.on("datachannel")
-    def on_datachannel(channel):
-        print(f"[{session_id}] DataChannel '{channel.label}' created")
-        # collector를 직접 생성하지 않고, 래퍼 딕셔너리를 사용해 관리
-        collector_wrapper = {'collector': app.state.ss.new_collector(session_id)}
+        print(f"[WS HANDSHAKE] session_id={session_id} path={getattr(websocket, 'url', None)}")
+        print("[WS HANDSHAKE] headers:", headers_dict)
+        print("[WS HANDSHAKE] cookies:", cookies_dict)
+        print("[WS HANDSHAKE] query_params:", query_dict)
 
-        async def run_inference_once():
-            """추론을 한 번만 실행하는 헬퍼 함수"""
-            collector = collector_wrapper['collector']
-            if collector.processed:
-                return
-            collector.processed = True
+        # Token extraction: prefer cookie, then Authorization header, then query param 'token'
+        token = None
+        token_source = None
+        try:
+            token = websocket.cookies.get(settings.COOKIE_ACCESS_TOKEN_NAME)
+            if token:
+                token_source = f"cookie({settings.COOKIE_ACCESS_TOKEN_NAME})"
+        except Exception:
+            token = None
 
-            print(f"[{session_id}] Flush signal received. Running inference...")
+        if not token:
+            auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
+            if auth_header:
+                parts = auth_header.split()
+                if len(parts) == 2 and parts[0].lower() == "bearer":
+                    token = parts[1]
+                    token_source = "authorization_header"
 
-            result = run_inference(app.state.ss.predictor, collector.frames)
-            result["timings"] = collector.build_timings()
+        if not token:
+            token = websocket.query_params.get("token")
+            if token:
+                token_source = "query_param"
 
-            await safe_send_json({
-                "type": "inference_result",
-                "data": result
-            })
+        print("[WS HANDSHAKE] resolved token source:", token_source is not None, token_source)
 
-            # 비동기 백그라운드로 퀴즈 저장 스케줄 (외부 호출에 영향을 주지 않도록 비동기 처리)
+        if not token:
+            print(f"[WS AUTH] No token found for session {session_id} - rejecting handshake")
+            await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
+            return
+
+        # --- 개발용 디버그: 서명 검증 전에 토큰의 헤더/페이로드(검증하지 않음)를 출력합니다. ---
+        try:
+            # 우선 python-jose 방식
             try:
-                import asyncio
-                asyncio.create_task(schedule_quiz_save(frames=collector.frames, inference_result=result, session_id=session_id))
-            except Exception as e:
-                print(f"[WS][WARN] Failed to schedule quiz save: {e}")
+                from jose import jwt as _jose_jwt
+                try:
+                    hdr = _jose_jwt.get_unverified_header(token)
+                except Exception:
+                    hdr = None
+                try:
+                    claims = _jose_jwt.get_unverified_claims(token)
+                except Exception:
+                    claims = None
+                print("[WS DEBUG] unverified token header:", hdr)
+                print("[WS DEBUG] unverified token payload:", claims)
+            except Exception:
+                # PyJWT 폴백
+                try:
+                    import jwt as _pyjwt
+                    try:
+                        hdr = _pyjwt.get_unverified_header(token)
+                    except Exception:
+                        hdr = None
+                    try:
+                        claims = _pyjwt.decode(token, options={"verify_signature": False})
+                    except Exception:
+                        claims = None
+                    print("[WS DEBUG] unverified token header:", hdr)
+                    print("[WS DEBUG] unverified token payload:", claims)
+                except Exception as _e:
+                    print("[WS DEBUG] failed to parse token unverified:", _e)
+        except Exception as _e:
+            print("[WS DEBUG] unexpected error while logging token unverified:", _e)
+        # ---------------------------------------------------------------------------
 
-        @channel.on("message")
-        async def on_message(message):
-            if isinstance(message, str):
-                if message == "flush":
-                    await run_inference_once()
-                elif message == "reset":
-                    print(f"[{session_id}] Resetting collector for new capture.")
-                    # 새 collector로 교체
-                    collector_wrapper['collector'] = app.state.ss.new_collector(session_id)
-                return
+        # Validate token and log result
+        try:
+            user_id = validate_token_and_get_user_id(token)
+            print(f"[WS AUTH] token validated for user_id={user_id}")
+        except Exception as e:
+            print(f"[WS AUTH] token validation failed: {e}")
+            await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
+            return
+    except Exception as _e:
+        print("[WS HANDSHAKE][ERROR] Unexpected handshake error:", _e)
+        await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
+        return
 
-            collector = collector_wrapper['collector']
-            # 추론이 시작되기 전까지(processed=False) 프레임을 계속 수집합니다.
-            if not collector.processed:
-                # 첫 프레임 수신 시 로그를 남깁니다.
-                if collector.start_ts is None:
-                    collector.start_collection()
-                    print(f"[{session_id}] First frame received. Collecting frames...")
-                collector.add_frame(message)
+    await websocket.accept()
+
+    # 세션용 collector가 없으면 새로 생성
+    collector = app.state.ss.collectors.get(session_id) or app.state.ss.new_collector(session_id)
 
     try:
         while True:
             raw = await websocket.receive_text()
-            msg = json.loads(raw)
-            action = msg.get("action")
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                # 텍스트가 JSON이 아닌 경우 무시
+                continue
 
-            if action == "offer":
-                sdp = msg.get("sdp")
-                offer = RTCSessionDescription(sdp=sdp, type=msg.get("type", "offer"))
+            mtype = msg.get("type")
+            if mtype == "meta":
+                # 단어 메타데이터를 세션 상태에 저장만 합니다 (저장 스케줄링은 제거)
+                collector.meta = {
+                    "word_pk": msg.get("word_pk"),
+                    "word_name": msg.get("word_name"),
+                    "user_id": user_id,
+                }
 
-                await pc.setRemoteDescription(offer)
-                answer = await pc.createAnswer()
-                await pc.setLocalDescription(answer)
+                # 클라이언트로 메타 수신 확인 응답만 보냅니다.
+                await websocket.send_text(json.dumps({"type": "meta_ack"}))
 
-                await safe_send_json({
-                    "type": "answer",
-                    "sdp": pc.localDescription.sdp,
-                })
+            elif mtype == "save_learning":
+                # 클라이언트에서 학습 데이터 저장 요청을 보냄
+                frames = getattr(collector, "frames", [])
+                session_meta = getattr(collector, "meta", {})
+                asyncio.create_task(
+                    schedule_learning_save(frames=frames, session_id=session_id, meta=session_meta)
+                )
+                await websocket.send_text(json.dumps({"type": "learning_ack", "status": "accepted"}))
 
-            elif action == "ice-candidate":
-                candidate_info = msg.get("candidate")
-                if candidate_info:
-                    candidate = RTCIceCandidate(
-                        sdpMid=candidate_info.get("sdpMid"),
-                        sdpMLineIndex=candidate_info.get("sdpMLineIndex"),
-                        candidate=candidate_info.get("candidate"),
-                    )
-                    await pc.addIceCandidate(candidate)
+            elif mtype == "flush":
+                # 클라이언트가 flush 시그널을 보내면 추론 실행하고, 추론 결과를 저장 스케줄링합니다.
+                predictor = app.state.ss.predictor
+                frames = getattr(collector, "frames", [])
 
+                # run_inference는 predictor가 None일 수 있으므로 내부에서 처리하도록 합니다.
+                result = run_inference(predictor, frames)
+
+                # 세션 메타(있다면)를 포함해 퀴즈 저장을 백그라운드로 스케줄합니다.
+                session_meta = getattr(collector, "meta", {})
+                asyncio.create_task(
+                    schedule_quiz_save(frames=frames, inference_result=result, session_id=session_id, meta=session_meta)
+                )
+
+                # 클라이언트로 추론 결과 전송
+                await websocket.send_text(json.dumps({"type": "inference_result", "result": result}))
+            else:
+                # 기타 메시지: 무시 또는 에코
+                await websocket.send_text(json.dumps({"type": "noop"}))
     except WebSocketDisconnect:
-        print(f"[WS] Disconnected: {peer_id}")
-    except Exception as e:
-        print(f"[WS][FATAL] Error in WebSocket handler for {peer_id}: {e}")
-        traceback.print_exc()
-    finally:
-        if peer_id in app.state.ss.active_peers:
-            pc_to_close = app.state.ss.active_peers.pop(peer_id)
-            await pc_to_close.close()
-        if session_id in app.state.ss.collectors:
-            del app.state.ss.collectors[session_id]
-        print(f"[WS] Cleaned up resources for {peer_id} (session: {session_id})")
+        # 연결 종료 시 리소스 정리
+        app.state.ss.collectors.pop(session_id, None)
+        return
+
+
+# 개발 편의용: 브라우저에서 테스트를 위해 토큰 쿠키를 설정하는 엔드포인트
+@app.get('/debug/set-cookie')
+async def debug_set_cookie(token: str):
+    """개발 편의용: 브라우저에서 테스트를 위해 토큰 쿠키를 설정합니다.
+
+    사용 예: /debug/set-cookie?token=eyJ... (개발 환경에서만 사용하세요)
+    이 엔드포인트는 실서비스에선 제거하거나 인증된 경로로 보호되어야 합니다.
+    """
+    resp = JSONResponse({"ok": True, "msg": "cookie set"})
+    # HttpOnly로 설정하여 JS에서 읽을 수 없도록 하는 것이 권장되지만,
+    # 개발 중에는 필요에 따라 변경 가능합니다.
+    resp.set_cookie(
+        key=settings.COOKIE_ACCESS_TOKEN_NAME,
+        value=token,
+        max_age=getattr(settings, 'COOKIE_ACCESS_TOKEN_MAX_AGE', None),
+        httponly=True,
+        secure=False,
+        samesite='lax'
+    )
+    return resp
 
 
 if __name__ == "__main__":
     import uvicorn
+    from pathlib import Path  # pathlib를 import합니다.
 
-    ssl_cert_path = BASE_DIR / "certs" / "cert.pem"
-    ssl_key_path = BASE_DIR / "certs" / "key.pem"
+    # 1. mkcert로 생성한 인증서의 절대 경로를 지정합니다.
+    # (Python에서는 C:\certs\... 보다 C:/certs/... (슬래시)를 쓰는 것이 편합니다)
+    ssl_cert_path = Path("C:/certs/localhost+1.pem")
+    ssl_key_path = Path("C:/certs/localhost+1-key.pem")
 
+    # 2. 해당 경로에 mkcert 인증서 파일이 있는지 확인합니다.
     if not ssl_cert_path.is_file() or not ssl_key_path.is_file():
-        print("[WARN] SSL certificates not found. Running without HTTPS.")
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        print(f"[ERROR] mkcert SSL certificates not found at C:/certs/")
+        print("Check if 'localhost+1.pem' and 'localhost+1-key.pem' exist.")
+        print("Server cannot start with HTTPS.")
     else:
-        print("[INFO] Starting server with HTTPS.")
+        print("[INFO] Starting server with mkcert HTTPS.")
         uvicorn.run(
-            app,
-            host="0.0.0.0",
+            app,  # 'app' 변수는 이 파일 상단 어딘가에 정의되어 있어야 합니다.
+
+            # 3. host를 127.0.0.1로 변경합니다.
+            # (Vite 프록시가 127.0.0.1을 바라보고, mkcert 인증서도 localhost/127.0.0.1용입니다)
+            host="127.0.0.1",
             port=8000,
+
+            # 4. mkcert 파일 경로를 문자열(str)로 전달합니다.
             ssl_keyfile=str(ssl_key_path),
             ssl_certfile=str(ssl_cert_path),
         )
+
