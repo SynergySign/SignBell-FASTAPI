@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import time
 import traceback
-import asyncio
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, cast
 
 from configs import settings
 
@@ -42,11 +41,10 @@ except Exception as _e:
     Predictor = None
 
 
-def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]:
+def run_inference(predictor: "Predictor", landmark_sequence: Optional[Any]) -> Dict[str, Any]:
     """
-    수집된 프레임에 대해 랜드마크 추출 및 모델 추론을 수행합니다.
-    (원래 main.py에 있던 내용을 여기로 옮겼습니다.)
-    변경: 이제 TARGET_FRAME_COUNT로 강제 패딩/절단하지 않습니다. 클라이언트에서 넘어온 프레임 시퀀스 그대로 추출하여 모델에 전달합니다.
+    이미 추출된 랜드마크 시퀀스(또는 None)를 받아 모델 추론을 수행합니다.
+    이 함수는 더 이상 원시 프레임을 받아 랜드마크를 추출하지 않습니다.
     """
     start = time.time()
     landmarks_info: Dict[str, Any] = {}
@@ -54,18 +52,21 @@ def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]
     score = 0.0
 
     try:
-        # 1. 랜드마크 추출
-        if extract_sequence_from_frames is None:
-            raise RuntimeError("Landmark extractor not available (missing heavy dependencies)")
+        # 입력으로 이미 랜드마크 시퀀스를 받는다고 가정합니다.
+        # len()가 지원되지 않는 타입도 있을 수 있으므로 안전하게 처리합니다.
+        empty_seq = False
+        try:
+            seq_len = len(landmark_sequence)  # may raise TypeError
+            empty_seq = (seq_len == 0)
+        except Exception:
+            seq_len = None
+            empty_seq = False
 
-        # NOTE: target_len=None 으로 호출하여 클라이언트에서 넘어온 길이를 유지합니다.
-        landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
-
-        # 2. 추출된 데이터 유효성 검사
-        if landmark_sequence is None or (hasattr(landmark_sequence, '__len__') and len(landmark_sequence) == 0):
-            landmarks_info = {"enabled": True, "error": "landmark_sequence is None or empty"}
-            predicted_label = "오류: 랜드마크를 감지하지 못했습니다."
-        elif np is not None and np.all(landmark_sequence == 0):
+        if landmark_sequence is None or empty_seq:
+             landmarks_info = {"enabled": True, "error": "landmark_sequence is None or empty"}
+             predicted_label = "오류: 랜드마크를 감지하지 못했습니다."
+        elif np is not None and (hasattr(landmark_sequence, '__array__') or hasattr(landmark_sequence, 'dtype')) and np.all(landmark_sequence == 0):
+            # numpy가 설치되어 있고, 배열 형태라면 전체 0 체크
             landmarks_info = {"enabled": True, "error": "All landmarks are zero (No detection)"}
             predicted_label = "오류: 랜드마크를 감지하지 못했습니다. (데이터 없음)"
         else:
@@ -76,12 +77,12 @@ def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]
             }
             if predictor is None:
                 raise RuntimeError("Predictor not available (missing heavy dependencies)")
-            landmark_sequence_float32 = landmark_sequence.astype(np.float32) if np is not None else landmark_sequence
-            # Static-analysis-safe local guard: ensure predictor is not None before calling
-            p = predictor
-            if p is None:
-                raise RuntimeError("Predictor not available (missing heavy dependencies)")
-            predicted_label, score = p.predict(landmark_sequence_float32)
+            landmark_sequence_float32 = landmark_sequence.astype(np.float32) if np is not None and hasattr(landmark_sequence, 'astype') else landmark_sequence
+            # static-analyzer friendly: cast predictor to Any before calling predict
+            p_any = cast(Any, predictor)
+            if not hasattr(p_any, "predict"):
+                raise RuntimeError("Predictor does not implement 'predict' method")
+            predicted_label, score = p_any.predict(landmark_sequence_float32)
 
     except Exception as e:
         print(f"[ERROR][inference_pipeline] Exception during inference: {e}")
@@ -91,13 +92,28 @@ def run_inference(predictor: "Predictor", frames: List[bytes]) -> Dict[str, Any]
         predicted_label = f"오류: 추론 중 예외 발생 ({error_message})"
 
     end = time.time()
+    # frames_used는 landmark_sequence의 첫 차원(시퀀스 길이)을 사용하거나 0으로 둡니다.
+    frames_used = 0
+    try:
+        if landmark_sequence is not None:
+            # prefer shape[0] for numpy-like objects, fallback to len()
+            if hasattr(landmark_sequence, 'shape') and getattr(landmark_sequence, 'shape'):
+                frames_used = int(landmark_sequence.shape[0])
+            else:
+                try:
+                    frames_used = int(len(landmark_sequence))
+                except Exception:
+                    frames_used = 0
+    except Exception:
+        frames_used = 0
+
     return {
         "predicted": predicted_label,
         "score": score,
         "inference_start": start,
         "inference_end": end,
         "inference_ms": int((end - start) * 1000),
-        "frames_used": len(frames),
+        "frames_used": frames_used,
         "landmarks": landmarks_info,
     }
 
@@ -182,7 +198,7 @@ except Exception:
         return {"ok": False, "reason": "no_storage"}
 
 
-async def schedule_quiz_save(frames: List[bytes], inference_result: Dict[str, Any], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
+async def schedule_quiz_save(landmark_sequence: Optional[object], inference_result: Dict[str, Any], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
     """
     추론 완료 후 퀴즈 결과를 비동기적으로 저장하도록 스케줄합니다.
     - frames에서 랜드마크 시퀀스를 추출하고, 저장 인터페이스로 전달합니다.
@@ -192,11 +208,7 @@ async def schedule_quiz_save(frames: List[bytes], inference_result: Dict[str, An
         meta = {}
 
     try:
-        if extract_sequence_from_frames is None:
-            landmark_sequence = None
-        else:
-            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
-
+        # 이미 랜드마크 시퀀스를 받는다고 가정합니다. (None이면 저장 로직에서 처리)
         res = await save_quiz(
             landmark_sequence=landmark_sequence,
             inference_result=inference_result,
@@ -210,7 +222,7 @@ async def schedule_quiz_save(frames: List[bytes], inference_result: Dict[str, An
         traceback.print_exc()
 
 
-async def schedule_learning_save(frames: List[bytes], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
+async def schedule_learning_save(landmark_sequence: Optional[object], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
     """
     학습 데이터 저장을 비동기적으로 스케줄합니다.
     - frames에서 랜드마크 시퀀스를 추출하여 저장 인터페이스로 전달합니다.
@@ -219,11 +231,7 @@ async def schedule_learning_save(frames: List[bytes], session_id: Optional[str] 
         meta = {}
 
     try:
-        if extract_sequence_from_frames is None:
-            landmark_sequence = None
-        else:
-            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
-
+        # 이미 랜드마크 시퀀스를 받는다고 가정합니다.
         res = await save_learning(
             landmark_sequence=landmark_sequence,
             session_id=session_id or meta.get("session_id", "unknown"),
@@ -237,5 +245,5 @@ async def schedule_learning_save(frames: List[bytes], session_id: Optional[str] 
 
 
 # 유틸: synchronous run_inference를 다른 쓰레드/태스크에서 호출할 때 사용하는 래퍼
-def run_inference_sync(predictor, frames):
-    return run_inference(predictor, frames)
+def run_inference_sync(predictor, landmark_sequence):
+    return run_inference(predictor, landmark_sequence)

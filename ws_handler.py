@@ -15,6 +15,10 @@ from fastapi import WebSocket, WebSocketDisconnect, status
 from security.jwt_validator import validate_token_and_get_user_id
 from configs import settings
 from inference_pipeline import run_inference, schedule_quiz_save, schedule_learning_save
+try:
+    from processing.landmark_extractor import extract_sequence_from_frames
+except Exception:
+    extract_sequence_from_frames = None
 
 
 async def websocket_handler(websocket: WebSocket, session_id: str, app_state: Any):
@@ -172,18 +176,46 @@ async def websocket_handler(websocket: WebSocket, session_id: str, app_state: An
                 elif mtype == "save_learning":
                     frames = getattr(collector, "frames", [])
                     session_meta = getattr(collector, "meta", {})
+                    # extract landmarks once and pass the landmark_sequence
+                    if extract_sequence_from_frames is None:
+                        landmark_sequence = None
+                    else:
+                        try:
+                            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
+                        except Exception as e:
+                            print(f"[WS][WARN] landmark extraction failed for save_learning: {e}")
+                            landmark_sequence = None
+
                     asyncio.create_task(
-                        schedule_learning_save(frames=frames, session_id=session_id, meta=session_meta)
+                        schedule_learning_save(landmark_sequence=landmark_sequence, session_id=session_id, meta=session_meta)
                     )
                     await websocket.send_text(json.dumps({"type": "learning_ack", "status": "accepted"}))
 
                 elif mtype == "flush":
                     predictor = app_state.predictor
                     frames = getattr(collector, "frames", [])
-                    result = run_inference(predictor, frames)
                     session_meta = getattr(collector, "meta", {})
+
+                    # extract landmarks once
+                    if extract_sequence_from_frames is None:
+                        landmark_sequence = None
+                    else:
+                        try:
+                            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
+                        except Exception as e:
+                            print(f"[WS][WARN] landmark extraction failed for flush: {e}")
+                            landmark_sequence = None
+
+                    # run inference with the extracted landmark_sequence
+                    result = run_inference(predictor, landmark_sequence)
+                    # override frames_used to reflect actual received frames (optional)
+                    try:
+                        result["frames_used"] = len(frames)
+                    except Exception:
+                        pass
+
                     asyncio.create_task(
-                        schedule_quiz_save(frames=frames, inference_result=result, session_id=session_id, meta=session_meta)
+                        schedule_quiz_save(landmark_sequence=landmark_sequence, inference_result=result, session_id=session_id, meta=session_meta)
                     )
                     await websocket.send_text(json.dumps({"type": "inference_result", "result": result}))
 
@@ -203,4 +235,3 @@ async def websocket_handler(websocket: WebSocket, session_id: str, app_state: An
             pass
         app_state.collectors.pop(session_id, None)
         return
-
