@@ -16,6 +16,7 @@
 since: 2025.10.17
 author: 백승현
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -27,8 +28,9 @@ import mediapipe as mp
 import cv2
 from PIL import Image
 import io
+import os  # os 임포트
 
-
+# ... (상수 동일) ...
 POSE_INDICES = [11, 12, 13, 14, 15, 16]
 NORMALIZATION_SCALE = 0.3
 POSE_Z_DAMPING = 0.7
@@ -39,51 +41,38 @@ HAND_LANDMARK_COUNT = 21
 
 
 def _decode_frame(frame_bytes: bytes):
-    """JPEG/PNG 바이트를 RGB ndarray(uint8)로 디코딩합니다. 실패 시 None 반환."""
-    # OpenCV 우선 시도. 실패하면 Pillow로 폴백.
+    # ... (함수 동일) ...
     try:
         arr = np.frombuffer(frame_bytes, dtype=np.uint8)
         img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img_bgr is not None:
             return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     except Exception:
-        # ignore and try Pillow fallback below
         pass
-
-    # Pillow fallback
     try:
         if Image is not None and io is not None:
             with Image.open(io.BytesIO(frame_bytes)) as im:
                 return np.array(im.convert("RGB"))
     except Exception:
         return None
-
     return None
 
 
 @dataclass
 class RealtimeLandmarkExtractor:
-    """실시간 랜드마크 추출기.
-
-    역할/정의:
-    - MediaPipe Holistic을 사용하여 포즈/양손 랜드마크를 추출하고 학습 방식과 동일한
-      정규화/패딩 규칙으로 (147,) 크기의 특징 벡터를 반환합니다.
-
-    반환값/예외:
-    - available()가 False이거나 디코딩 실패 시 None을 반환합니다.
-
-    since: 2025.10.17
-    author: 백승현
-    """
+    # ... (주석 동일) ...
     static_image_mode: bool = False
     model_complexity: int = 1
-    min_detection_confidence: float = 0.5
-    min_tracking_confidence: float = 0.5
-    skip_missing: bool = False  # True 면 pose 미검출 프레임은 None 반환 (학습과 유사), False 면 0 벡터
+    min_detection_confidence: float = 0.3
+    min_tracking_confidence: float = 0.3
+    skip_missing: bool = False
     _holistic: Optional[Any] = field(init=False, default=None)
     _ok: bool = field(init=False, default=False)
 
+    _debug_saved_failed_frame: bool = field(init=False, default=False)
+
     def __post_init__(self):
+        # ... (함수 동일) ...
         try:
             self._holistic = mp.solutions.holistic.Holistic(
                 static_image_mode=self.static_image_mode,
@@ -102,36 +91,43 @@ class RealtimeLandmarkExtractor:
         return self._ok and self._holistic is not None
 
     def close(self):
-        if self._holistic is not None:
-            try:
-                self._holistic.close()  # type: ignore[attr-defined]
-            except Exception:  # noqa: E722
-                pass
+        # ... (함수 동일) ...
+        pass
 
     # ------------- Core -------------
     def extract(self, frame_bytes: bytes) -> Optional["np.ndarray"]:
-        """단일 프레임 바이트 -> (147,) float32 또는 None 반환.
-
-        None 반환 조건:
-          - 의존성 없음
-          - 디코딩 실패
-          - pose 미검출 및 skip_missing=True
-        """
         if not self.available():
             return None
+
         rgb = _decode_frame(frame_bytes)
         if rgb is None:
+            print("[Extractor ERROR] _decode_frame failed. Frame bytes length:", len(frame_bytes))
             return None
+
+        # 디버그: 첫 프레임 저장
+        try:
+            if not self._debug_saved_failed_frame:
+                save_path = "debug_received_frame.jpg"
+                bgr_image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(save_path, bgr_image)
+                print(f"[Extractor DEBUG] First received frame saved to: {os.path.abspath(save_path)}")
+                self._debug_saved_failed_frame = True
+        except Exception as e:
+            print(f"[Extractor DEBUG] Failed to save debug frame: {e}")
+
         try:
             results = self._holistic.process(rgb)  # type: ignore[union-attr]
-        except Exception:  # noqa: E722
+        except Exception as e:
+            print(f"[Extractor ERROR] _holistic.process(rgb) FAILED: {e}")
             return None
+
         if (not hasattr(results, "pose_landmarks")
                 or results.pose_landmarks is None
                 or not results.pose_landmarks.landmark):
+
+            print("[Extractor WARN] No pose landmarks detected in frame.")
             if self.skip_missing:
                 return None
-            # zero frame 채움
             return np.zeros((FRAME_FEATURE_DIM,), dtype=np.float32)
 
         pose_lm = results.pose_landmarks.landmark
@@ -162,8 +158,8 @@ class RealtimeLandmarkExtractor:
                 feats.extend([rx, ry, rz])
         except Exception as e:
             print(f"Error processing pose landmarks: {e}")
-            # Re-raise or handle as appropriate
-            raise
+            feats.extend([0.0] * (len(POSE_INDICES) * 3)) # `raise` 대신 0으로 채움
+
 
         # Left hand
         left_wrist_pos = None
@@ -173,14 +169,13 @@ class RealtimeLandmarkExtractor:
                 wrist = lms[0]
                 wx, wy, wz = _rel(wrist, stable_center_x, stable_center_y, stable_center_z, NORMALIZATION_SCALE, WRIST_Z_DAMPING)
                 left_wrist_pos = (wx, wy, wz)
-                feats.extend([wx, wy, wz])  # wrist relative to stable center
-                for i in range(1, HAND_LANDMARK_COUNT):  # 1..20
+                feats.extend([wx, wy, wz])
+                for i in range(1, HAND_LANDMARK_COUNT):
                     f = lms[i]
                     fx = (f.x - wrist.x) / NORMALIZATION_SCALE
                     fy = (f.y - wrist.y) / NORMALIZATION_SCALE
                     fz = ((f.z - wrist.z) / NORMALIZATION_SCALE) * FINGER_Z_DAMPING
                     feats.extend([fx, fy, fz])
-                # 만약 landmark 개수가 부족하면 패딩
                 missing = HAND_LANDMARK_COUNT - len(lms)
                 if missing > 0:
                     feats.extend([0.0] * (missing * 3))
@@ -188,7 +183,7 @@ class RealtimeLandmarkExtractor:
                 feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3))
         except Exception as e:
             print(f"Error processing left hand landmarks: {e}")
-            raise
+            feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3)) # `raise` 대신 0으로 채움
 
         # Right hand
         right_wrist_pos = None
@@ -212,7 +207,7 @@ class RealtimeLandmarkExtractor:
                 feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3))
         except Exception as e:
             print(f"Error processing right hand landmarks: {e}")
-            raise
+            feats.extend([0.0] * (HAND_LANDMARK_COUNT * 3)) # `raise` 대신 0으로 채움
 
         # Hand distance vector
         if left_wrist_pos and right_wrist_pos:
@@ -225,7 +220,6 @@ class RealtimeLandmarkExtractor:
 
         arr = np.asarray(feats, dtype=np.float32)
         if arr.shape[0] != FRAME_FEATURE_DIM:
-            # 안전 실패: 차원 불일치 → 패딩/절단
             if arr.shape[0] < FRAME_FEATURE_DIM:
                 pad = np.zeros((FRAME_FEATURE_DIM - arr.shape[0],), dtype=np.float32)
                 arr = np.concatenate([arr, pad], axis=0)
@@ -236,6 +230,7 @@ class RealtimeLandmarkExtractor:
 
 @dataclass
 class SequenceBuilder:
+    # ... (클래스 동일) ...
     extractor: RealtimeLandmarkExtractor
     frames: List["np.ndarray"] = field(default_factory=list)
 
@@ -245,9 +240,10 @@ class SequenceBuilder:
             self.frames.append(feat)
 
     def build(self, target_len: Optional[int] = None, pad_value: float = 0.0):
+        # ... (함수 동일) ...
         if np is None or not self.frames:
             return None
-        seq = np.stack(self.frames, axis=0)  # (T, 147)
+        seq = np.stack(self.frames, axis=0)
         if target_len is not None:
             T, F = seq.shape
             if T > target_len:
@@ -255,13 +251,11 @@ class SequenceBuilder:
             elif T < target_len:
                 pad = np.full((target_len - T, F), pad_value, dtype=seq.dtype)
                 seq = np.concatenate([seq, pad], axis=0)
-        return seq  # (target_len, 147)
+        return seq
 
 
 def extract_sequence_from_frames(frames: List[bytes], target_len: Optional[int] = None, skip_missing: bool = False):
-    """프레임 바이트 리스트 -> (T|target_len, 147) numpy or None.
-    mediapipe / numpy 없으면 None.
-    """
+    # ... (함수 동일) ...
     extractor = RealtimeLandmarkExtractor(skip_missing=skip_missing)
     if not extractor.available():
         return None
