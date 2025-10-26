@@ -108,27 +108,14 @@ class SequenceCollector:
     """세션별 프레임 수집기."""
     frames: List[bytes] = field(default_factory=list)
 
-    # --- ⬇️ 수정: start_ts 와 processed 필드 제거 ⬇️ ---
-    # start_ts: Optional[float] = None
-    # processed: bool = False
-    # --- ⬆️ 수정 완료 ⬆️ ---
-
-    # --- ⬇️ 수정: start_collection 메서드 제거 ⬇️ ---
-    # def start_collection(self):
-    #     ...
-    # --- ⬆️ 수정 완료 ⬆️ ---
 
     def add_frame(self, data: bytes):
         """
         최대 프레임 수를 초과하지 않은 경우에만 프레임을 추가합니다.
         (시간제한 및 processed 로직 제거)
         """
-        # --- ⬇️ 수정: if self.processed: return 제거 ⬇️ ---
-        # if self.processed:
-        #     return
-        # --- ⬆️ 수정 완료 ⬆️ ---
 
-        # --- ⬇️ 수정: 타이머(start_ts) 체크 로직 제거 ⬇️ ---
+
         if not self.is_full():
             if len(self.frames) < MAX_FRAMES_TO_COLLECT:
                 self.frames.append(data)
@@ -137,11 +124,6 @@ class SequenceCollector:
     def is_full(self) -> bool:
         """프레임 수 조건으로 수집이 완료되었는지 판단합니다."""
 
-        # --- ⬇️ 수정: 타이머(start_ts) 체크 로직 제거 ⬇️ ---
-        # if self.start_ts is None:
-        #     return False
-        # ... (시간 관련 if 문 제거) ...
-        # --- ⬆️ 수정 완료 ⬆️ ---
 
         if len(self.frames) >= MAX_FRAMES_TO_COLLECT:
             return True
@@ -158,27 +140,70 @@ class SequenceCollector:
         }
         # --- ⬆️ 수정 완료 ⬆️ ---
 
-# ------------------ Background saving scheduler ------------------
-# ... (이하 저장 로직 동일) ...
 try:
-    from storage import save_quiz, save_learning
-except Exception:
+    from storage.local_file_saver import save_learning_data as save_learning
+    from storage.local_file_saver import save_quiz_data as save_quiz
+    print("[inference_pipeline] Successfully imported from storage.local_file_saver.")
+except Exception as _e:
+
+    print(f"[inference_pipeline][ERROR] Failed to import from local_file_saver: {_e}")
+
     async def save_quiz(*args, **kwargs):
-        print("[inference_pipeline] save_quiz dummy called")
-        return {"ok": False, "reason": "no_storage"}
+        print("[inference_pipeline] save_quiz dummy called (Import Failed)")
+        return {"ok": False, "reason": "no_storage_import_failed"}
 
     async def save_learning(*args, **kwargs):
-        print("[inference_pipeline] save_learning dummy called")
-        return {"ok": False, "reason": "no_storage"}
+        print("[inference_pipeline] save_learning dummy called (Import Failed)")
+        return {"ok": False, "reason": "no_storage_import_failed"}
 
 
-async def schedule_quiz_save(landmark_sequence: Optional[object], inference_result: Dict[str, Any], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
-    # ... (함수 내용 동일) ...
-    pass
+async def schedule_quiz_save(
+        landmark_sequence: Optional[object],
+        inference_result: Dict[str, Any],
+        session_id: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None
+):
+    """(비동기) 퀴즈 결과 및 랜드마크를 저장소에 저장합니다."""
+    # [추가] landmark_sequence가 numpy 배열인지 확인
+    seq_np = cast(np.ndarray, landmark_sequence) if (np is not None and isinstance(landmark_sequence, np.ndarray)) else None
+    sid = session_id or "unknown_session"
+    m = meta or {}
 
-async def schedule_learning_save(landmark_sequence: Optional[object], session_id: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
-    # ... (함수 내용 동일) ...
-    pass
+    try:
+        # [추가] 위에서 import한 save_quiz 함수 호출
+        result = await save_quiz(
+            landmark_sequence=seq_np,
+            inference_result=inference_result,
+            session_id=sid,
+            meta=m
+        )
+        print(f"[schedule_quiz_save] Save result: {result.get('ok')}, path: {result.get('npy_path') or result.get('meta_path')}")
+    except Exception as e:
+        print(f"[schedule_quiz_save][ERROR] Failed to save quiz data for {sid}: {e}")
+        traceback.print_exc()
+
+async def schedule_learning_save(
+        landmark_sequence: Optional[object],
+        session_id: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None
+):
+    """(비동기) 학습 데이터(랜드마크)를 저장소에 저장합니다."""
+    # [추가] landmark_sequence가 numpy 배열인지 확인
+    seq_np = cast(np.ndarray, landmark_sequence) if (np is not None and isinstance(landmark_sequence, np.ndarray)) else None
+    sid = session_id or "unknown_session"
+    m = meta or {}
+
+    try:
+        # [추가] 위에서 import한 save_learning 함수 호출
+        result = await save_learning(
+            landmark_sequence=seq_np,
+            session_id=sid,
+            meta=m
+        )
+        print(f"[schedule_learning_save] Save result: {result.get('ok')}, path: {result.get('npy_path') or result.get('meta_path')}")
+    except Exception as e:
+        print(f"[schedule_learning_save][ERROR] Failed to save learning data for {sid}: {e}")
+        traceback.print_exc()
 
 def run_inference_sync(predictor, landmark_sequence):
     return run_inference(predictor, landmark_sequence)
