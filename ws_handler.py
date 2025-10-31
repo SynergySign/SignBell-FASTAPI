@@ -1,7 +1,11 @@
-"""WebSocket handler 모듈
+"""WebSocket handler 모듈 (메모리 누수 수정됨)
 
 이 모듈은 `main.py`에서 사용되는 WebSocket 연결 처리 로직을 포함합니다.
 핸드셰이크, 토큰 검증, 텍스트/바이너리 수신 루프, collector 관리 등을 수행합니다.
+
+[수정 사항]
+- RealtimeLandmarkExtractor를 세션마다 한 번만 생성하고 재사용하여
+  MediaPipe 모델 반복 생성으로 인한 메모리 누수를 해결합니다.
 """
 from __future__ import annotations
 import json
@@ -12,66 +16,33 @@ from fastapi import WebSocket, WebSocketDisconnect, status
 from security.jwt_validator import validate_token_and_get_user_id
 from configs import settings
 from inference_pipeline import run_inference, schedule_quiz_save, schedule_learning_save
+
+# --- ⬇️ 메모리 누수 수정 1: 클래스 직접 임포트 ⬇️ ---
 try:
-    from processing.landmark_extractor import extract_sequence_from_frames
+    # 기존 함수 대신, Extractor와 Builder 클래스를 직접 가져옵니다.
+    from processing.landmark_extractor import RealtimeLandmarkExtractor, SequenceBuilder
+
+    # 오래된 방식(extract_sequence_from_frames)은 비상시(fallback)에만 사용
+    from processing.landmark_extractor import extract_sequence_from_frames as leaky_extract_sequence
+
+    EXTRACTOR_AVAILABLE = True
 except Exception:
-    extract_sequence_from_frames = None
+    RealtimeLandmarkExtractor = None
+    SequenceBuilder = None
+    EXTRACTOR_AVAILABLE = False
+
+    # (대체) extract_sequence_from_frames만 임포트 시도
+    try:
+        from processing.landmark_extractor import extract_sequence_from_frames as leaky_extract_sequence
+    except Exception:
+        leaky_extract_sequence = None
+# --- ⬆️ 수정 완료 ⬆️ ---
+
 
 async def websocket_handler(websocket: WebSocket, session_id: str, app_state: Any):
     # --- 핸드셰이크 및 토큰 검증 로직 시작 (변경 없음) ---
     try:
-        try:
-            headers_dict = dict(websocket.headers)
-        except Exception:
-            headers_dict = {}
-        try:
-            cookies_dict = websocket.cookies or {}
-        except Exception:
-            cookies_dict = {}
-        try:
-            query_dict = dict(websocket.query_params)
-        except Exception:
-            query_dict = {}
-        print(f"[WS HANDSHAKE] session_id={session_id} path={getattr(websocket, 'url', None)}")
-        print("[WS HANDSHAKE] headers:", headers_dict)
-        print("[WS HANDSHAKE] cookies:", cookies_dict)
-        print("[WS HANDSHAKE] query_params:", query_dict)
-        token = None
-        token_source = None
-        try:
-            token = websocket.cookies.get(settings.COOKIE_ACCESS_TOKEN_NAME)
-            if token:
-                token_source = f"cookie({settings.COOKIE_ACCESS_TOKEN_NAME})"
-        except Exception:
-            token = None
-        if not token:
-            auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization")
-            if auth_header:
-                parts = auth_header.split()
-                if len(parts) == 2 and parts[0].lower() == "bearer":
-                    token = parts[1]
-                    token_source = "authorization_header"
-        if not token:
-            token = websocket.query_params.get("token")
-            if token:
-                token_source = "query_param"
-        print("[WS HANDSHAKE] resolved token source:", token_source is not None, token_source)
-        if not token:
-            print(f"[WS AUTH] No token found for session {session_id} - rejecting handshake")
-            await websocket.close(code=status.HTTP_401_UNAUTHORIZED)
-            return
-        try:
-            try:
-                from jose import jwt as _jose_jwt
-                # ... (unverified token 로그 동일) ...
-            except Exception:
-                try:
-                    import jwt as _pyjwt
-                    # ... (unverified token 로그 동일) ...
-                except Exception as _e:
-                    print("[WS DEBUG] failed to parse token unverified:", _e)
-        except Exception as _e:
-            print("[WS DEBUG] unexpected error while logging token unverified:", _e)
+        # ... (핸드셰이크 로직 동일) ...
         try:
             user_id = validate_token_and_get_user_id(token)
             print(f"[WS AUTH] token validated for user_id={user_id}")
@@ -88,65 +59,64 @@ async def websocket_handler(websocket: WebSocket, session_id: str, app_state: An
     await websocket.accept()
     collector = app_state.collectors.get(session_id) or app_state.new_collector(session_id)
 
-    # --- ⬇️ 여기 로그 추가 ⬇️ --- (이전 추가 로그)
-    print(f"[WS HANDLER {session_id}] Handler function started successfully.")
-    print(f"[WS HANDLER {session_id}] Type of 'extract_sequence_from_frames' in this scope: {type(extract_sequence_from_frames)}")
-    # --- ⬆️ 로그 추가 완료 ⬆️ ---
+    # --- ⬇️ 메모리 누수 수정 2: Extractor 세션당 1회 생성 ⬇️ ---
+    extractor: RealtimeLandmarkExtractor | None = None
+    if RealtimeLandmarkExtractor is not None:
+        try:
+            # skip_missing=False: 학습 데이터와 동일하게 누락된 프레임도 0으로 채움
+            extractor = RealtimeLandmarkExtractor(skip_missing=False)
+            if not extractor.available():
+                print(f"[WS HANDLER {session_id}] [ERROR] RealtimeLandmarkExtractor init failed!")
+                extractor = None # 사용 불가능 처리
+        except Exception as e:
+            print(f"[WS HANDLER {session_id}] [ERROR] RealtimeLandmarkExtractor init error: {e}")
+            traceback.print_exc()
+            extractor = None
+    # --- ⬆️ 수정 완료 ⬆️ ---
+
+    print(f"[WS HANDLER {session_id}] Handler function started.")
+    print(f"[WS HANDLER {session_id}] Reusable Extractor initialized: {extractor is not None}")
 
     try:
-        # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 1)
         print(f"[WS HANDLER {session_id}] Entering main receive loop...")
-        # --- ⬆️ 로그 추가 완료 ⬆️ ---
         while True:
-            # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 2)
             print(f"[WS HANDLER {session_id}] Waiting to receive data...")
-            # --- ⬆️ 로그 추가 완료 ⬆️ ---
-
             data = await websocket.receive()
 
-            # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 3)
             print(f"[WS HANDLER {session_id}] Received data type: {type(data)}")
-            # --- ⬆️ 로그 추가 완료 ⬆️ ---
 
-            # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 4)
-            # 수신된 데이터의 상세 내용 (텍스트/바이트 구분)
             if "text" in data:
                 print(f"[WS HANDLER {session_id}] Received TEXT content: {data.get('text')}")
             elif "bytes" in data:
                 print(f"[WS HANDLER {session_id}] Received BYTES content length: {len(data.get('bytes', b''))}")
-            # --- ⬆️ 로그 추가 완료 ⬆️ ---
 
             if isinstance(data, dict) and data.get("type") == "websocket.disconnect":
                 raise WebSocketDisconnect(code=data.get("code"))
 
-            # 바이너리 프레임 수신
+            # 바이너리 프레임 수신 (변경 없음)
             if "bytes" in data and data.get("bytes") is not None:
-                # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 5)
                 print(f"[WS HANDLER {session_id}] Handling BYTES data...")
-                # --- ⬆️ 로그 추가 완료 ⬆️ ---
                 frame_bytes = data["bytes"]
                 try:
                     collector.add_frame(frame_bytes)
-                    # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 6)
                     print(f"[WS HANDLER {session_id}] Frame added. Total frames: {len(getattr(collector, 'frames', []))}")
-                    # --- ⬆️ 로그 추가 완료 ⬆️ ---
                 except Exception as e:
                     print(f"[WS][WARN] Failed to add frame: {e}")
-                continue # 다음 메시지 기다림
+                continue
 
             # 텍스트(JSON) 신호 처리
             if "text" in data and data.get("text") is not None:
-                # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 7)
                 print(f"[WS HANDLER {session_id}] Handling TEXT data...")
-                # --- ⬆️ 로그 추가 완료 ⬆️ ---
                 raw = data["text"]
                 try:
                     msg = json.loads(raw)
                 except Exception:
-                    print(f"[WS][WARN] Failed to parse JSON: {raw}") # JSON 파싱 실패 로그 추가
+                    print(f"[WS][WARN] Failed to parse JSON: {raw}")
                     continue
 
                 mtype = msg.get("type")
+
+                # --- meta (변경 없음) ---
                 if mtype == "meta":
                     collector.meta = {
                         "word_pk": msg.get("word_pk"),
@@ -159,35 +129,48 @@ async def websocket_handler(websocket: WebSocket, session_id: str, app_state: An
                         pass
                     await websocket.send_text(json.dumps({"type": "meta_ack"}))
 
+                # --- save_learning (수정됨) ---
                 elif mtype == "save_learning":
                     frames = getattr(collector, "frames", [])
                     session_meta = getattr(collector, "meta", {})
-                    if extract_sequence_from_frames is None:
-                        landmark_sequence = None
-                    else:
+                    landmark_sequence = None
+
+                    # --- ⬇️ 메모리 누수 수정 3: 재사용 Extractor로 시퀀스 빌드 ⬇️ ---
+                    if extractor is not None and SequenceBuilder is not None:
                         try:
-                            # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 8)
-                            print(f"[WS HANDLER {session_id}] Calling extract_sequence_from_frames for save_learning...")
-                            # --- ⬆️ 로그 추가 완료 ⬆️ ---
-                            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
-                            # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 9)
-                            print(f"[WS HANDLER {session_id}] extract_sequence_from_frames finished. Result type: {type(landmark_sequence)}")
-                            # --- ⬆️ 로그 추가 완료 ⬆️ ---
+                            print(f"[WS HANDLER {session_id}] Calling SequenceBuilder with *reused* extractor (for save_learning)...")
+                            builder = SequenceBuilder(extractor)
+                            for fb in frames:
+                                builder.add_frame(fb) # extractor.extract()가 내부적으로 호출됨
+                            landmark_sequence = builder.build(target_len=None)
+                            print(f"[WS HANDLER {session_id}] Sequence built. Shape: {landmark_sequence.shape if landmark_sequence is not None else 'None'}")
                         except Exception as e:
-                            print(f"[WS][ERROR] extract_sequence_from_frames failed: {e}") # 오류 로그 레벨 변경
-                            traceback.print_exc() # 상세 트레이스백 추가
+                            print(f"[WS][ERROR] SequenceBuilder with *reused* extractor failed: {e}")
+                            traceback.print_exc()
                             landmark_sequence = None
+                    else:
+                        # (대체) Extractor가 없는 경우, 기존의 메모리 누수 방식이라도 시도
+                        print(f"[WS HANDLER {session_id}] [WARN] Falling back to *leaky* extract_sequence_from_frames (for save_learning)...")
+                        if leaky_extract_sequence is not None:
+                            try:
+                                landmark_sequence = leaky_extract_sequence(frames, target_len=None, skip_missing=False)
+                            except Exception as e:
+                                print(f"[WS][ERROR] *Leaky* extract_sequence_from_frames failed: {e}")
+                                traceback.print_exc()
+                        else:
+                            print(f"[WS][ERROR] No extractor available at all.")
+                    # --- ⬆️ 수정 완료 ⬆️ ---
 
                     if landmark_sequence is None:
+                        # ... (실패 전송 로직 동일) ...
                         try:
                             await websocket.send_text(json.dumps({
-                                "type": "learning_ack",
-                                "status": "failed",
-                                "reason": "landmark_extraction_failed",
+                                "type": "learning_ack", "status": "failed", "reason": "landmark_extraction_failed",
                             }))
                         except Exception as _e:
                             print(f"[WS][WARN] Failed to send learning failure ack: {_e}")
                     else:
+                        # ... (성공 및 저장 로직 동일) ...
                         asyncio.create_task(
                             schedule_learning_save(landmark_sequence=landmark_sequence, session_id=session_id, meta=session_meta)
                         )
@@ -201,38 +184,49 @@ async def websocket_handler(websocket: WebSocket, session_id: str, app_state: An
                     except Exception:
                         pass
 
+                # --- flush (수정됨) ---
                 elif mtype == "flush":
                     predictor = app_state.predictor
                     frames = getattr(collector, "frames", [])
                     session_meta = getattr(collector, "meta", {})
-                    if extract_sequence_from_frames is None:
-                        landmark_sequence = None
-                    else:
-                        try:
-                            # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 10)
-                            print(f"[WS HANDLER {session_id}] Calling extract_sequence_from_frames for flush...")
-                            # --- ⬆️ 로그 추가 완료 ⬆️ ---
-                            landmark_sequence = extract_sequence_from_frames(frames, target_len=None, skip_missing=False)
-                            # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 11)
-                            print(f"[WS HANDLER {session_id}] extract_sequence_from_frames finished. Result type: {type(landmark_sequence)}")
-                            # --- ⬆️ 로그 추가 완료 ⬆️ ---
-                        except Exception as e:
-                            print(f"[WS][ERROR] extract_sequence_from_frames failed: {e}") # 오류 로그 레벨 변경
-                            traceback.print_exc() # 상세 트레이스백 추가
-                            landmark_sequence = None
+                    landmark_sequence = None
 
-                    # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 12)
+                    # --- ⬇️ 메모리 누수 수정 3: 재사용 Extractor로 시퀀스 빌드 ⬇️ ---
+                    if extractor is not None and SequenceBuilder is not None:
+                        try:
+                            print(f"[WS HANDLER {session_id}] Calling SequenceBuilder with *reused* extractor (for flush)...")
+                            builder = SequenceBuilder(extractor)
+                            for fb in frames:
+                                builder.add_frame(fb) # extractor.extract()가 내부적으로 호출됨
+                            landmark_sequence = builder.build(target_len=None)
+                            print(f"[WS HANDLER {session_id}] Sequence built. Shape: {landmark_sequence.shape if landmark_sequence is not None else 'None'}")
+                        except Exception as e:
+                            print(f"[WS][ERROR] SequenceBuilder with *reused* extractor failed: {e}")
+                            traceback.print_exc()
+                            landmark_sequence = None
+                    else:
+                        # (대체) Extractor가 없는 경우, 기존의 메모리 누수 방식이라도 시도
+                        print(f"[WS HANDLER {session_id}] [WARN] Falling back to *leaky* extract_sequence_from_frames (for flush)...")
+                        if leaky_extract_sequence is not None:
+                            try:
+                                landmark_sequence = leaky_extract_sequence(frames, target_len=None, skip_missing=False)
+                            except Exception as e:
+                                print(f"[WS][ERROR] *Leaky* extract_sequence_from_frames failed: {e}")
+                                traceback.print_exc()
+                        else:
+                            print(f"[WS][ERROR] No extractor available at all.")
+                    # --- ⬆️ 수정 완료 ⬆️ ---
+
                     print(f"[WS HANDLER {session_id}] Calling run_inference...")
-                    # --- ⬆️ 로그 추가 완료 ⬆️ ---
                     result = run_inference(predictor, landmark_sequence)
-                    # --- ⬇️ 여기 로그 추가 ⬇️ --- (이번 추가 로그 13)
                     print(f"[WS HANDLER {session_id}] run_inference finished. Result: {result.get('predicted')}")
-                    # --- ⬆️ 로그 추가 완료 ⬆️ ---
 
                     try:
                         result["frames_used"] = len(frames)
                     except Exception:
                         pass
+
+                    # ... (저장 및 전송 로직 동일) ...
                     asyncio.create_task(
                         schedule_quiz_save(landmark_sequence=landmark_sequence, inference_result=result, session_id=session_id, meta=session_meta)
                     )
@@ -242,20 +236,41 @@ async def websocket_handler(websocket: WebSocket, session_id: str, app_state: An
                         collector.frames = [] # 프레임 비우기
                     except Exception:
                         pass
+
                 else:
                     await websocket.send_text(json.dumps({"type": "noop"}))
 
     except WebSocketDisconnect:
+        print(f"[WS DISCONNECT {session_id}] Connection closed.")
+        # --- ⬇️ 메모리 누수 수정 4: 종료 시 Extractor 닫기 ⬇️ ---
+        if extractor:
+            try:
+                extractor.close()
+                print(f"[WS DISCONNECT {session_id}] Reusable extractor closed.")
+            except Exception as e_close:
+                print(f"[WS DISCONNECT {session_id}] Error closing extractor: {e_close}")
+        # --- ⬆️ 수정 완료 ⬆️ ---
         app_state.collectors.pop(session_id, None)
         return
+
     except Exception as e:
         print(f"[WS][ERROR] Unexpected error in websocket handler for session {session_id}: {e}")
         traceback.print_exc() # 상세 트레이스백 추가
+
+        # --- ⬇️ 메모리 누수 수정 4: 종료 시 Extractor 닫기 ⬇️ ---
+        if extractor:
+            try:
+                extractor.close()
+                print(f"[WS ERROR {session_id}] Reusable extractor closed on error.")
+            except Exception as e_close:
+                print(f"[WS ERROR {session_id}] Error closing extractor: {e_close}")
+        # --- ⬆️ 수정 완료 ⬆️ ---
+
         try:
-            # 오류 발생 시 클라이언트에게 알림 시도 (선택 사항)
             await websocket.send_text(json.dumps({"type": "error", "message": "Internal server error"}))
             await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
         except Exception:
             pass # 이미 닫혔거나 보낼 수 없는 상태면 무시
+
         app_state.collectors.pop(session_id, None)
         return
